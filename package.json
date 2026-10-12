@@ -1,0 +1,33 @@
+{
+  "name": "kasho-pay-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Kasho Pay API: Supabase auth + wallet ledger + Freda Pay (MonCash, NatCash, cards)",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke.ts",
+    "test": "node --import tsx --test scripts/security.test.ts",
+    "webhook:register": "tsx scripts/register-webhook.ts",
+    "encrypt:existing": "tsx scripts/encrypt-existing.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.16.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=20 <23"
+  }
+}
