@@ -5,7 +5,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { supabaseAdmin } from "./supabase.js";
 import * as L from "./ledger.js";
 import { fredaConfigured, fredaMode, verifyWebhookSignature } from "./freda.js";
-import { STEP_UP, clearStepUpFailures, hasVerifiedTotp, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
+import { STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { bearerToken, createRateLimiter, getHandler, isJsonRequest, makeOriginCheck, noStore, securityHeaders } from "./security.js";
@@ -188,13 +188,14 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
 
 // Sensitive actions: re-check the password (and the 2FA code when 2FA is on) before running.
 async function stepUp(req: AuthedRequest, res: Response, next: NextFunction) {
-  const rule = Object.prototype.hasOwnProperty.call(STEP_UP, String(req.params["name"])) ? STEP_UP[String(req.params["name"])] : undefined;
-  if (!rule) return next();
+  const name = String(req.params["name"]);
+  const rule = Object.prototype.hasOwnProperty.call(STEP_UP, name) ? STEP_UP[name] : undefined;
+  if (!rule && !mfaEndpointRequired(name)) return next();
   const ctx = req.ctx!;
   if (req.mfaRequired && req.aal !== "aal2") {
     return res.status(403).json({ error: { message: "Enter your 2FA code to continue.", code: "MFA_REQUIRED" } });
   }
-  if (!rule.field) return next(); // 2FA-only rule (card details): the card code is verified by the handler
+  if (!rule || !rule.field) return next(); // 2FA-only rule (card details): the card code is verified by the handler
   const pw = req.body?.[rule.field];
   if (typeof pw !== "string" || !pw || pw.length > 200) {
     return res.status(403).json({ error: { message: "Confirm your password to continue.", code: "PASSWORD_REQUIRED" } });

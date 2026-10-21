@@ -13,6 +13,21 @@ export const STEP_UP: Record<string, { field: string; strip: boolean }> = {
   adminDeleteFee: { field: "confirmPassword", strip: true },
 };
 
+/**
+ * Endpoints that move money or expose personal data. With ENFORCE_MFA_ALL=true, a user who enabled 2FA must hold an
+ * aal2 session (2FA code passed) for ALL of them, not only the ones in STEP_UP. Off by default because the web app
+ * only asks for the 2FA code on a few actions today: turn it on once the app prompts for the code before these.
+ */
+export const MFA_ENDPOINTS: ReadonlySet<string> = new Set([
+  "sendMoney", "startDeposit", "startWithdrawal", "createCardFn", "createHolderFn", "fundCardFn", "withdrawCardFn",
+  "terminateCardFn", "freezeCardFn", "removeCardFn", "updateCardFn", "setCardCode", "revealCardFn", "getIdentity",
+  "changePassword", "changeEmail", "createKycSession", "adminListFees", "adminSaveFee", "adminDeleteFee",
+]);
+
+export function mfaEndpointRequired(name: string, enforceAll = process.env["ENFORCE_MFA_ALL"] === "true"): boolean {
+  return enforceAll && MFA_ENDPOINTS.has(name);
+}
+
 /** Reads the `aal` claim ("aal1" | "aal2") of an already verified access token. */
 export function tokenAal(token: string): "aal1" | "aal2" {
   try {

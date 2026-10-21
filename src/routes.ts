@@ -8,6 +8,7 @@ import { getConfig, normalizeHaitiPhone, round2 } from "./config.js";
 import { FEE_OPERATIONS, TIERED_OPERATIONS, amountRange, computeFee, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import { decryptField, encryptField, hashCardCode, verifyCardCode } from "./crypto.js";
 import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup.js";
+import { cardCodeAttemptAllowed, resetCardCodeAttempts } from "./cardcode.js";
 import { createSession, diditConfigured, getDecision, mapStatus, DiditError } from "./didit.js";
 
 export type Ctx = { userId: string; email: string; ip: string | null; ua: string | null; token?: string };
@@ -336,7 +337,10 @@ export const handlers: Record<string, Handler> = {
         await L.patchTx(tx.id, { provider_ref: payment.id, meta: { ...tx.meta, method } });
         return { transactionId: tx.id as string, checkoutUrl: (payment.checkout_url ?? null) as string | null, amountHtg, ussd: method === "moncash_ussd", fee };
       } catch (e) {
-        await L.failTx(tx.id, "Could not start payment");
+        // Unknown outcome (timeout, 5xx): the payment may exist on Freda and be paid later. Closing the row now would
+        // make the webhook ignore that payment (user pays, wallet never credited), so leave it pending: the webhook
+        // settles it, or the reconcile loop expires it after 24h. No wallet money was reserved for a deposit.
+        if (!(e instanceof FredaError && e.ambiguous)) await L.failTx(tx.id, "Could not start payment");
         throw e;
       }
     },
@@ -373,7 +377,7 @@ export const handlers: Record<string, Handler> = {
       // 1) reserve the money atomically (throws INSUFFICIENT_FUNDS if the wallet is short)
       const txId = await L.debit({
         user: c.userId, kind: "withdrawal", title: `Withdrawal to ${name}`, category: "Withdrawal", method: name,
-        amount: amountUsd, fee, status: "pending",
+        amount: amountUsd, fee, status: "pending", dailyLimit: cfg.dailyWithdrawLimitUsd, // re-checked atomically with the debit
         meta: { provider: d.provider, recipient, amount_htg: amountHtg, rate: cfg.htgPerUsd },
       });
       const tx = await L.getTx(txId);
@@ -435,6 +439,7 @@ export const handlers: Record<string, Handler> = {
       }
       const { data: ref, error } = await L.db.rpc("kasho_transfer", {
         p_from: c.userId, p_to: target.id, p_amount: amount, p_note: d.note ?? "", p_fee: fee,
+        p_daily_limit: cfg.dailyTransferLimitUsd, // re-checked atomically under the wallet lock
       });
       if (error) throw error;
       const { data: me } = await L.db.from("profiles").select("display_name, username").eq("id", c.userId).single();
@@ -734,7 +739,12 @@ export const handlers: Record<string, Handler> = {
         if (!(e instanceof FredaError && e.status === 404)) throw e; // 404 = card no longer exists = closed
       }
       await L.db.from("cards").update({ status: "terminated", balance: 0 }).eq("id", card.id);
-      if (tx) await L.completeTx(tx.id);
+      // A parallel terminate request (double click) must not credit the same balance twice: only the oldest
+      // closing row of this card is credited, the others are closed without moving money.
+      if (tx) {
+        if (await L.hasOlderTerminateTx(card.id, tx)) await L.failTx(tx.id, "Card already closed by another request");
+        else await L.completeTx(tx.id);
+      }
       await L.notify(c.userId, "Card closed", `${card.label} was closed permanently.`);
       return { refunded: remaining };
     },
@@ -771,6 +781,7 @@ export const handlers: Record<string, Handler> = {
       if (error) throw error;
       await L.db.from("profiles").update({ card_code_set: true }).eq("id", c.userId);
       clearStepUpFailures(`code:${c.userId}`);
+      await resetCardCodeAttempts(L.db, c.userId);
       return { ok: true };
     },
   },
@@ -783,11 +794,14 @@ export const handlers: Record<string, Handler> = {
       // 5 wrong codes lock card details for 15 minutes (a 4-digit code has only 10,000 possibilities).
       const lockKey = `code:${c.userId}`;
       if (stepUpLocked(lockKey)) throw new L.AppError("Too many wrong codes. Try again in 15 minutes.");
+      // Shared, restart-proof counter (in the database): each guess uses one of 5 attempts before it is checked.
+      if (!(await cardCodeAttemptAllowed(L.db, c.userId))) throw new L.AppError("Too many wrong codes. Try again in 15 minutes.");
       if (!verifyCardCode(d.code, row.code_hash)) {
         recordStepUpFailure(lockKey);
         throw new L.AppError("Incorrect code.");
       }
       clearStepUpFailures(lockKey);
+      await resetCardCodeAttempts(L.db, c.userId);
       const card = await L.getOwnedCard(c.userId, d.cardId);
       if (card.status !== "active" || !card.freda_card_id) throw new L.AppError("This card is not active.");
       const r: any = await freda.revealCard(card.freda_card_id);

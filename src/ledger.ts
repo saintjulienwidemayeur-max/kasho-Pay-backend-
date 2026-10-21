@@ -3,6 +3,7 @@
 import { supabaseAdmin } from "./supabase.js";
 import { FredaError, freda, fredaMode, pickArray, pickId } from "./freda.js";
 import { FeeError, loadFeeRules, type FeeRule } from "./fees.js";
+import { isSafeRemoteUrl } from "./security.js";
 
 // supabaseAdmin is intentionally loosely typed here (rpc results, jsonb meta).
 export const db: any = supabaseAdmin;
@@ -73,6 +74,7 @@ export function toUserError(e: any): Error {
   if (msg.includes("RECIPIENT_NOT_FOUND")) return new AppError("We could not find that Kasho user.");
   if (msg.includes("SELF_TRANSFER")) return new AppError("You cannot send money to yourself.");
   if (msg.includes("INVALID_AMOUNT")) return new AppError("Enter a valid amount.");
+  if (msg.includes("DAILY_LIMIT")) return new AppError("Daily limit reached. Please try again later.");
 
   console.error("[kasho]", e);
   return new AppError("Something went wrong. Please try again.");
@@ -102,11 +104,13 @@ export const debit = (a: {
   user: string; kind: string; title: string; category: string; method: string;
   amount: number; fee?: number; status?: "pending" | "completed"; card?: string | null;
   provider?: string; meta?: Record<string, unknown>;
+  /** Rolling 24h cap for this kind, enforced atomically in the database (0 = none). */
+  dailyLimit?: number;
 }) =>
   rpc<string>("kasho_debit", {
     p_user: a.user, p_kind: a.kind, p_title: a.title, p_category: a.category, p_method: a.method,
     p_amount: a.amount, p_fee: a.fee ?? 0, p_status: a.status ?? "pending", p_card: a.card ?? null,
-    p_provider: a.provider ?? "freda", p_meta: a.meta ?? {},
+    p_provider: a.provider ?? "freda", p_meta: a.meta ?? {}, p_daily_limit: a.dailyLimit ?? 0,
   });
 
 /** Active fee rules (table fee_rules). Read on every request so an admin change applies immediately. */
@@ -410,6 +414,14 @@ export async function spentLast24h(userId: string, kinds: string[]): Promise<num
   return (data ?? []).reduce((sum: number, r: any) => sum + Math.max(0, -Number(r.amount)) + Number(r.fee ?? 0), 0);
 }
 
+/** True when another closing row (card_withdraw with meta.terminate) of this card is older than `tx` and still counts (pending or completed). */
+export async function hasOlderTerminateTx(cardId: string, tx: { id: string; created_at: string }): Promise<boolean> {
+  const { data, error } = await db.from("transactions").select("id, created_at")
+    .eq("card_id", cardId).eq("kind", "card_withdraw").eq("meta->>terminate", "true").neq("id", tx.id).neq("status", "failed");
+  if (error) throw error;
+  return (data ?? []).some((o: any) => o.created_at < tx.created_at || (o.created_at === tx.created_at && o.id < tx.id));
+}
+
 export async function getOwnedCard(userId: string, cardId: string) {
   const { data, error } = await db.from("cards").select("*").eq("id", cardId).eq("user_id", userId).maybeSingle();
   if (error) throw error;
@@ -507,7 +519,7 @@ export async function storeKycDocument(userId: string, idv: any): Promise<Record
   if (!idv) return out;
   out["kyc_doc_type"] = mapDocType(idv.document_type);
   const url = idv.front_image ?? idv.full_front_image;
-  if (typeof url === "string" && /^https:\/\//.test(url)) {
+  if (isSafeRemoteUrl(url)) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
