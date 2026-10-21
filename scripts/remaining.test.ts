@@ -181,3 +181,23 @@ test("migration: idempotent kasho_transfer, legacy kyc policies dropped, service
   assert.match(sql, /drop policy if exists "kyc_upload_own_folder" on storage\.objects/);
   assert.match(sql, /drop policy if exists "kyc_read_own_folder" on storage\.objects/);
 });
+
+test("card_fund without a flag (server crashed after the debit): replayed only after 3 minutes", async () => {
+  const card = { id: "c1", freda_card_id: "card_9", balance: 5, label: "L" };
+  const fresh = fundTx({ meta: {}, created_at: new Date(Date.now() - 60_000).toISOString() });
+  const f1 = fakeDb({ cards: card });
+  await withFake(f1, async () => {
+    let called = false;
+    freda.fundCard = (async () => { called = true; return {}; }) as any;
+    assert.equal(await L.settleTransaction(fresh), "pending");
+    assert.equal(called, false, "the original request may still be running");
+  });
+  const f2 = fakeDb({ cards: card, notifications: null });
+  await withFake(f2, async () => {
+    let args: any[] = [];
+    freda.fundCard = (async (...a: any[]) => { args = a; return { balance: 25 }; }) as any;
+    const crashed = fundTx({ meta: {}, created_at: new Date(Date.now() - 10 * 60_000).toISOString() });
+    assert.equal(await L.settleTransaction(crashed), "completed");
+    assert.deepEqual(args, ["card_9", 20, "KP-1"]);
+  });
+});

@@ -158,6 +158,8 @@ export const underpaidMeta = (paidHtg: number, expectedHtg: number) =>
 
 /** A card_fund whose Freda call had an unknown outcome may be replayed (same idempotency key) for this long. */
 export const REPLAY_WINDOW_MS = 24 * 3600 * 1000;
+/** Do not replay a card funding that has no needs_review flag before this age: the original request may still be running. */
+export const FUND_REPLAY_MIN_AGE_MS = 3 * 60_000;
 /** Do not replay a card creation younger than this: the original request may still be running. */
 const CARD_REPLAY_MIN_AGE_MS = 60_000;
 
@@ -229,10 +231,13 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
     return "pending";
   }
 
-  if (tx.kind === "card_fund" && tx.card_id && tx.meta?.needs_review) {
-    // Ambiguous Freda answer (timeout / 5xx) when the card was funded. Replaying POST /fund with the SAME reference is
-    // safe: Freda answers with the original result (idempotent_replay) and never moves the money twice.
-    if (Date.now() - new Date(tx.created_at).getTime() > REPLAY_WINDOW_MS) {
+  if (tx.kind === "card_fund" && tx.card_id) {
+    // Ambiguous Freda answer (needs_review), or the server died after the wallet debit and before/while calling Freda
+    // (no flag, so only after FUND_REPLAY_MIN_AGE_MS). Replaying POST /fund with the SAME reference is safe: Freda answers
+    // with the original result (idempotent_replay) and never moves the money twice.
+    const age = Date.now() - new Date(tx.created_at).getTime();
+    if (!tx.meta?.needs_review && age < FUND_REPLAY_MIN_AGE_MS) return "pending";
+    if (age > REPLAY_WINDOW_MS) {
       console.error("[card_fund] still needs manual review after 24h:", tx.reference);
       return "pending";
     }

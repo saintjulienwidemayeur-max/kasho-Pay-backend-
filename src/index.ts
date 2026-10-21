@@ -291,7 +291,7 @@ async function reconcile() {
     // (idempotent). Only for rows younger than 24h; older ones stay flagged for manual review and are logged hourly.
     {
       const { data: funds } = await L.db.from("transactions").select("*")
-        .eq("status", "pending").eq("kind", "card_fund").eq("meta->>needs_review", "true")
+        .eq("status", "pending").eq("kind", "card_fund")
         .gt("created_at", new Date(Date.now() - L.REPLAY_WINDOW_MS).toISOString())
         .lt("created_at", new Date(Date.now() - 15_000).toISOString())
         .order("created_at").limit(10);
@@ -300,7 +300,7 @@ async function reconcile() {
       }
       if (tick % 120 === 1) {
         const { data: stale } = await L.db.from("transactions").select("reference").eq("status", "pending").eq("kind", "card_fund")
-          .eq("meta->>needs_review", "true").lt("created_at", new Date(Date.now() - L.REPLAY_WINDOW_MS).toISOString()).limit(50);
+          .lt("created_at", new Date(Date.now() - L.REPLAY_WINDOW_MS).toISOString()).limit(50);
         for (const r of stale ?? []) console.error("[reconcile] card_fund needs manual review (older than 24h):", r.reference);
       }
     }
