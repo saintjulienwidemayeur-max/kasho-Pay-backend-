@@ -11,6 +11,8 @@ export function getConfig() {
     minDepositUsd: num("MIN_DEPOSIT_USD", 1),
     minWithdrawUsd: num("MIN_WITHDRAW_USD", 1),
     minCardFundUsd: num("MIN_CARD_FUND_USD", 1),
+    // First load put on a card when it is created (the "prefund")
+    minCardPrefundUsd: num("MIN_CARD_PREFUND_USD", 2),
     // Rolling 24h caps per user (0 disables a cap)
     dailyTransferLimitUsd: num("DAILY_TRANSFER_LIMIT_USD", 2000),
     dailyWithdrawLimitUsd: num("DAILY_WITHDRAW_LIMIT_USD", 2000),
