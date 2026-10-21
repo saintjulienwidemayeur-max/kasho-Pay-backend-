@@ -7,6 +7,8 @@ export class FredaError extends Error {
   code: string;
   /** Raw JSON body returned by Freda (may contain details/fields that explain the rejection). */
   raw?: unknown;
+  /** "POST /v1/payments": which call failed (for logs; never contains the body). */
+  endpoint = "";
   constructor(status: number, code: string, message: string, raw?: unknown) {
     super(message);
     this.raw = raw;
@@ -76,7 +78,9 @@ async function call<T = any>(method: string, path: string, body?: unknown): Prom
       }
       if (!res.ok) {
         const err = json?.error;
-        throw new FredaError(res.status, err?.code ?? "PROVIDER_ERROR", err?.message ?? `Freda request failed (${res.status})`, json ?? text.slice(0, 500));
+        const fe = new FredaError(res.status, err?.code ?? "PROVIDER_ERROR", err?.message ?? `Freda request failed (${res.status})`, json ?? text.slice(0, 500));
+        fe.endpoint = `${method} ${path.split("?")[0]}`;
+        throw fe;
       }
       return json as T;
     } catch (e) {
