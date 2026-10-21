@@ -2,6 +2,7 @@
 // Freda operations, card synchronisation and user-facing error mapping.
 import { supabaseAdmin } from "./supabase.js";
 import { FredaError, freda, fredaMode, pickArray, pickId } from "./freda.js";
+import { FeeError, loadFeeRules, type FeeRule } from "./fees.js";
 
 // supabaseAdmin is intentionally loosely typed here (rpc results, jsonb meta).
 export const db: any = supabaseAdmin;
@@ -13,6 +14,7 @@ const UNAVAILABLE = "This service is temporarily unavailable. Please try again l
 
 export function toUserError(e: any): Error {
   if (e instanceof AppError) return e;
+  if (e instanceof FeeError) return new AppError(e.message);
 
   if (e instanceof FredaError) {
     console.error("[freda]", e.status, e.code, e.message);
@@ -96,6 +98,9 @@ export const debit = (a: {
     p_provider: a.provider ?? "freda", p_meta: a.meta ?? {},
   });
 
+/** Active fee rules (table fee_rules). Read on every request so an admin change applies immediately. */
+export const feeRules = (): Promise<FeeRule[]> => loadFeeRules(db);
+
 export const completeTx = (id: string) => rpc<boolean>("kasho_complete_tx", { p_tx: id });
 export const failTx = (id: string, reason: string) => rpc<boolean>("kasho_fail_tx", { p_tx: id, p_reason: reason });
 
@@ -141,7 +146,7 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
       }
       await mergeTxMeta(tx, { fee_htg: p.fee ?? null, net_htg: p.net_amount ?? null });
       if (await completeTx(tx.id)) {
-        await notify(tx.user_id, "Wallet funded", `${money(tx.amount)} added via ${tx.method}`);
+        await notify(tx.user_id, "Wallet funded", `${money(Number(tx.amount) - Number(tx.fee ?? 0))} added via ${tx.method}`);
       }
       return "completed";
     }
@@ -212,7 +217,7 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
     if (moved === true) {
       if (await completeTx(tx.id)) {
         await db.from("cards").update(tx.meta?.terminate ? { status: "terminated", balance: 0 } : { balance: d.balance }).eq("id", card.id);
-        await notify(tx.user_id, "Card withdrawal completed", `${money(amount)} returned to your wallet.`);
+        await notify(tx.user_id, "Card withdrawal completed", `${money(amount - Number(tx.fee ?? 0))} returned to your wallet.`);
       }
       return "completed";
     }

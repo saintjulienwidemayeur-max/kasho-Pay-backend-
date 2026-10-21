@@ -8,6 +8,9 @@ export const STEP_UP: Record<string, { field: string; strip: boolean }> = {
   startWithdrawal: { field: "confirmPassword", strip: true },
   changePassword: { field: "currentPassword", strip: false },
   changeEmail: { field: "currentPassword", strip: false },
+  // Changing fees moves money for every user: re-check the admin's password.
+  adminSaveFee: { field: "confirmPassword", strip: true },
+  adminDeleteFee: { field: "confirmPassword", strip: true },
 };
 
 /** Reads the `aal` claim ("aal1" | "aal2") of an already verified access token. */

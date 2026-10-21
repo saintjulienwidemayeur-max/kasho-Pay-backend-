@@ -5,6 +5,7 @@ import * as L from "./ledger.js";
 import { readCardDetails } from "./ledger.js";
 import { freda, FredaError, fredaConfigured, fredaMode, pickArray, pickId } from "./freda.js";
 import { getConfig, normalizeHaitiPhone, round2 } from "./config.js";
+import { FEE_OPERATIONS, TIERED_OPERATIONS, amountRange, computeFee, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import { decryptField, encryptField, hashCardCode, verifyCardCode } from "./crypto.js";
 import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup.js";
 import { createSession, diditConfigured, getDecision, mapStatus, DiditError } from "./didit.js";
@@ -106,22 +107,108 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
   };
 }
 
+/** Only users listed in the `admins` table (server-only) may change fees. */
+async function requireAdmin(c: Ctx) {
+  const { data } = await L.db.from("admins").select("user_id").eq("user_id", c.userId).maybeSingle();
+  if (!data) throw new L.AppError("You do not have access to this.");
+}
+
+const feeRuleInput = z.object({
+  id: z.string().uuid().optional(),
+  operation: z.enum(FEE_OPERATIONS),
+  label: z.string().trim().max(80).default(""),
+  feeType: z.enum(["flat", "percent"]),
+  minAmount: z.number().min(0).max(100000).nullable().default(null),
+  maxAmount: z.number().min(0).max(100000).nullable().default(null),
+  feeValue: z.number().min(0).max(100000),
+  active: z.boolean().default(true),
+});
+
 export const handlers: Record<string, Handler> = {
   // ---------------------------------------------------------------- config
   getPublicConfig: {
     schema: z.object({}).passthrough(),
     run: async () => {
       const c = getConfig();
+      const rules = await L.feeRules();
+      // Brackets of top-ups and withdrawals also set the amount range users can enter.
+      const dep = amountRange(rules, "wallet_deposit");
+      const wd = amountRange(rules, "wallet_withdrawal");
       return {
         htgPerUsd: c.htgPerUsd,
-        withdrawFeePercent: c.withdrawFeePercent,
-        cardCreationFeeUsd: c.cardCreationFeeUsd,
-        minDepositUsd: c.minDepositUsd,
-        minWithdrawUsd: c.minWithdrawUsd,
+        // The fee schedule shown in the app (the server recomputes every fee itself when money moves).
+        fees: rules.map(({ operation, feeType, minAmount, maxAmount, feeValue }) => ({ operation, feeType, minAmount, maxAmount, feeValue })),
+        minDepositUsd: Math.max(c.minDepositUsd, dep?.min ?? 0),
+        maxDepositUsd: dep?.max ?? null,
+        minWithdrawUsd: Math.max(c.minWithdrawUsd, wd?.min ?? 0),
+        maxWithdrawUsd: wd?.max ?? null,
         minCardFundUsd: c.minCardFundUsd,
         requireKycForCards: c.requireKycForCards,
         sandbox: fredaConfigured() ? fredaMode() === "sandbox" : true,
       };
+    },
+  },
+
+  // ---------------------------------------------------------------- admin: fee schedule
+  adminStatus: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      const { data } = await L.db.from("admins").select("user_id").eq("user_id", c.userId).maybeSingle();
+      return { isAdmin: !!data };
+    },
+  },
+
+  /** Every fee rule, including inactive ones. */
+  adminListFees: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      await requireAdmin(c);
+      const { data, error } = await L.db.from("fee_rules").select("*").order("operation").order("min_amount", { nullsFirst: true });
+      if (error) throw error;
+      return { operations: FEE_OPERATIONS, tiered: TIERED_OPERATIONS, rules: (data ?? []).map(rowToRule) };
+    },
+  },
+
+  /** Creates a rule (no id) or updates one (id). Password is checked by the step-up middleware. */
+  adminSaveFee: {
+    schema: feeRuleInput.extend({ confirmPassword: z.string().optional() }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const { data: all, error: listErr } = await L.db.from("fee_rules").select("*");
+      if (listErr) throw listErr;
+      const others: FeeRule[] = (all ?? []).map(rowToRule);
+      const rule = {
+        ...(d.id ? { id: d.id } : {}), operation: d.operation as FeeOperation, feeType: d.feeType,
+        minAmount: d.minAmount, maxAmount: d.maxAmount, feeValue: Math.round(d.feeValue * 10000) / 10000, active: d.active,
+      };
+      if (d.id && !others.some((o) => o.id === d.id)) throw new L.AppError("Fee rule not found.");
+      const problem = validateRule(rule, others);
+      if (problem) throw new L.AppError(problem);
+      const row = {
+        operation: rule.operation, label: d.label, fee_type: rule.feeType, min_amount: rule.minAmount, max_amount: rule.maxAmount,
+        fee_value: rule.feeValue, active: rule.active, updated_by: c.userId,
+      };
+      const { data, error } = d.id
+        ? await L.db.from("fee_rules").update(row).eq("id", d.id).select("*").single()
+        : await L.db.from("fee_rules").insert(row).select("*").single();
+      if (error) throw error;
+      await L.db.from("activity_log").insert({
+        user_id: c.userId, event: "Fee rule changed", detail: `${rule.operation} ${rule.feeType} ${rule.feeValue} [${rule.minAmount ?? ""}-${rule.maxAmount ?? ""}] active=${rule.active}`,
+        ip: c.ip, user_agent: c.ua,
+      });
+      return rowToRule(data);
+    },
+  },
+
+  adminDeleteFee: {
+    schema: z.object({ id: z.string().uuid(), confirmPassword: z.string().optional() }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const { data, error } = await L.db.from("fee_rules").delete().eq("id", d.id).select("operation");
+      if (error) throw error;
+      if (!data?.length) throw new L.AppError("Fee rule not found.");
+      await L.db.from("activity_log").insert({ user_id: c.userId, event: "Fee rule deleted", detail: String(data[0].operation), ip: c.ip, user_agent: c.ua });
+      return { ok: true };
     },
   },
 
@@ -228,13 +315,16 @@ export const handlers: Record<string, Handler> = {
       const cfg = getConfig();
       const amountUsd = round2(d.amountUsd);
       if (amountUsd < cfg.minDepositUsd) throw new L.AppError(`Minimum deposit is $${cfg.minDepositUsd}.`);
+      // The user pays the full amount through MonCash / NatCash; the fee is kept from what is credited to the wallet.
+      const fee = computeFee(await L.feeRules(), "wallet_deposit", amountUsd);
+      if (fee >= amountUsd) throw new L.AppError("That amount is too small to cover the fee.");
       const amountHtg = Math.ceil(amountUsd * cfg.htgPerUsd);
       const name = providerName(d.provider);
       const phone = d.phone ? normalizeHaitiPhone(d.phone) : null;
 
       const tx = await L.insertTx({
         user_id: c.userId, kind: "deposit", title: `Top-up via ${name}`, category: "Top-up", method: name,
-        amount: amountUsd, fee: 0, status: "pending", provider: "freda",
+        amount: amountUsd, fee, status: "pending", provider: "freda",
         meta: { provider: d.provider, amount_htg: amountHtg, rate: cfg.htgPerUsd },
       });
       try {
@@ -244,7 +334,7 @@ export const handlers: Record<string, Handler> = {
           amount: amountHtg, method, reference: tx.reference, ...(method === "moncash_ussd" ? { phone: phone! } : {}),
         });
         await L.patchTx(tx.id, { provider_ref: payment.id, meta: { ...tx.meta, method } });
-        return { transactionId: tx.id as string, checkoutUrl: (payment.checkout_url ?? null) as string | null, amountHtg, ussd: method === "moncash_ussd" };
+        return { transactionId: tx.id as string, checkoutUrl: (payment.checkout_url ?? null) as string | null, amountHtg, ussd: method === "moncash_ussd", fee };
       } catch (e) {
         await L.failTx(tx.id, "Could not start payment");
         throw e;
@@ -271,7 +361,7 @@ export const handlers: Record<string, Handler> = {
       const recipient = normalizeHaitiPhone(d.phone);
       if (!recipient) throw new L.AppError("Enter a valid MonCash or NatCash number (e.g. 509 3700 1234).");
 
-      const fee = round2((amountUsd * cfg.withdrawFeePercent) / 100);
+      const fee = computeFee(await L.feeRules(), "wallet_withdrawal", amountUsd);
       const amountHtg = Math.floor(amountUsd * cfg.htgPerUsd);
       const name = providerName(d.provider);
 
@@ -337,18 +427,20 @@ export const handlers: Record<string, Handler> = {
       if (!target) throw new L.AppError("We could not find that Kasho user.");
       const amount = round2(d.amountUsd);
       const cfg = getConfig();
+      // The sender pays the amount plus the fee; the recipient receives the full amount.
+      const fee = computeFee(await L.feeRules(), "transfer", amount);
       if (cfg.dailyTransferLimitUsd > 0) {
         const used = await L.spentLast24h(c.userId, ["transfer_out"]);
         if (used + amount > cfg.dailyTransferLimitUsd) throw new L.AppError(`Daily transfer limit reached ($${cfg.dailyTransferLimitUsd} per 24 hours).`);
       }
       const { data: ref, error } = await L.db.rpc("kasho_transfer", {
-        p_from: c.userId, p_to: target.id, p_amount: amount, p_note: d.note ?? "",
+        p_from: c.userId, p_to: target.id, p_amount: amount, p_note: d.note ?? "", p_fee: fee,
       });
       if (error) throw error;
       const { data: me } = await L.db.from("profiles").select("display_name, username").eq("id", c.userId).single();
       await L.notify(target.id, "Money received", `${me?.display_name || "@" + me?.username} sent you $${amount.toFixed(2)}`);
-      await L.notify(c.userId, "Money sent", `$${amount.toFixed(2)} sent to ${target.display_name || "@" + target.username}`);
-      return { reference: ref as string, recipient: (target.display_name || `@${target.username}`) as string };
+      await L.notify(c.userId, "Money sent", `$${amount.toFixed(2)} sent to ${target.display_name || "@" + target.username}${fee > 0 ? ` (fee $${fee.toFixed(2)})` : ""}`);
+      return { reference: ref as string, recipient: (target.display_name || `@${target.username}`) as string, fee };
     },
   },
 
@@ -377,6 +469,7 @@ export const handlers: Record<string, Handler> = {
       const amount = round2(d.amountUsd);
       if (amount < cfg.minCardFundUsd) throw new L.AppError(`Minimum card funding is $${cfg.minCardFundUsd}.`);
       const label = d.label?.trim() || "Kasho virtual debit";
+      const fee = computeFee(await L.feeRules(), "card_creation", amount); // read before any holder / card is created
 
       const mode = fredaMode();
       // The customer never picks a card holder: the latest one for this account is used, or one is created automatically.
@@ -466,7 +559,6 @@ export const handlers: Record<string, Handler> = {
 
       const cardId = crypto.randomUUID();
       const reference = `kasho_card_${cardId}`;
-      const fee = cfg.cardCreationFeeUsd;
 
       const txId = await L.debit({
         user: c.userId, kind: "card_creation", title: `New card: ${label}`, category: "Card", method: "Wallet",
@@ -524,10 +616,11 @@ export const handlers: Record<string, Handler> = {
       if (card.status !== "active" || !card.freda_card_id) throw new L.AppError("This card is not active.");
       const amount = round2(d.amountUsd);
       if (amount < cfg.minCardFundUsd) throw new L.AppError(`Minimum is $${cfg.minCardFundUsd}.`);
+      const fee = computeFee(await L.feeRules(), "card_fund", amount); // the card receives `amount`, the wallet pays amount + fee
 
       const txId = await L.debit({
         user: c.userId, kind: "card_fund", title: `Added to ${card.label}`, category: "Card",
-        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, card: card.id,
+        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee, card: card.id,
       });
       try {
         await freda.fundCard(card.freda_card_id, amount);
@@ -552,6 +645,9 @@ export const handlers: Record<string, Handler> = {
       const card = await L.getOwnedCard(c.userId, d.cardId);
       if (card.status !== "active" || !card.freda_card_id) throw new L.AppError("This card is not active.");
       const amount = round2(d.amountUsd);
+      // `amount` leaves the card; the wallet is credited amount - fee (kasho_complete_tx).
+      const fee = computeFee(await L.feeRules(), "card_withdraw", amount);
+      if (amount <= fee) throw new L.AppError(`The amount must be more than the $${fee.toFixed(2)} fee.`);
       // Real balance on Freda, read before anything moves. It is the reference used to recover from a crash.
       const before = readCardDetails(await freda.getCard(card.freda_card_id)).balance;
       if (before === undefined) throw new L.AppError("Could not read the card balance. Try again.");
@@ -560,7 +656,7 @@ export const handlers: Record<string, Handler> = {
       // The ledger row exists BEFORE the provider call: if the server dies in between, reconcile() settles it.
       const tx = await L.insertTx({
         user_id: c.userId, kind: "card_withdraw", title: `Moved from ${card.label}`, category: "Card",
-        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee: 0, status: "pending", card_id: card.id, provider: "freda",
+        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee, status: "pending", card_id: card.id, provider: "freda",
         meta: { freda_balance_before: before },
       });
       try {

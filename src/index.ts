@@ -151,6 +151,8 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   fileDisputeFn: { windowMs: HOUR, max: 20 },
   sendSupportMessage: { windowMs: HOUR, max: 5 },
   logActivity: { windowMs: MIN, max: 20 },
+  adminSaveFee: { windowMs: MIN, max: 20 },
+  adminDeleteFee: { windowMs: MIN, max: 20 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();
 for (const [name, l] of Object.entries(endpointLimits)) {
