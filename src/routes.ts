@@ -165,6 +165,7 @@ export const handlers: Record<string, Handler> = {
         minWithdrawUsd: Math.max(c.minWithdrawUsd, wd?.min ?? 0),
         maxWithdrawUsd: wd?.max ?? null,
         minCardFundUsd: c.minCardFundUsd,
+        minCardPrefundUsd: c.minCardPrefundUsd,
         requireKycForCards: c.requireKycForCards,
         sandbox: fredaConfigured() ? fredaMode() === "sandbox" : true,
       };
@@ -520,7 +521,7 @@ export const handlers: Record<string, Handler> = {
         throw new L.AppError("Verify your identity before creating a card.");
       }
       const amount = round2(d.amountUsd);
-      if (amount < cfg.minCardFundUsd) throw new L.AppError(`Minimum card funding is $${cfg.minCardFundUsd}.`);
+      if (amount < cfg.minCardPrefundUsd) throw new L.AppError(`Minimum prefund is $${cfg.minCardPrefundUsd}.`);
       const label = d.label?.trim() || "Kasho virtual debit";
       const fee = computeFee(await L.feeRules(), "card_creation", amount); // read before any holder / card is created
 

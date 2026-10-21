@@ -63,7 +63,7 @@ export function toUserError(e: any): Error {
   if (e instanceof FeeError) return new AppError(e.message);
 
   if (e instanceof FredaError) {
-    console.error("[freda]", e.status, e.code, e.message); // code/status/message only: never the body
+    console.error("[freda]", e.endpoint, e.status, e.code, e.message); // endpoint/code/status/message only: never the body
     if (isPayerInsufficientFunds(e)) {
       return new AppError("The balance on your mobile money account is too low for this payment. Add funds and try again.");
     }
