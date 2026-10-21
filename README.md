@@ -26,13 +26,13 @@ Error: `{ "error": { "message": "..." } }`.
 | --- | --- |
 | `getPublicConfig` | rates, fees, minimums, sandbox flag |
 | `logActivity` | write a security activity entry |
-| `submitKyc` | save identity details (files are uploaded by the app to the private `kyc-documents` bucket) |
 | `startDeposit` / `syncTransaction` | MonCash / NatCash top-up (`/v1/payments`) and status check |
-| `startWithdrawal` | wallet to MonCash / NatCash (`/v1/payouts`), fee `WITHDRAW_FEE_PERCENT` |
+| `startWithdrawal` | wallet to MonCash / NatCash (`/v1/payouts`), fee from the fee schedule |
 | `searchUsers` / `sendMoney` | Kasho to Kasho transfers by `@username` |
 | `createHolderFn` | step 1 of cards: register the card holder (`/v1/cards/holders`), stored in `card_holders` |
 | `createCardFn` `syncCardFn` `fundCardFn` `withdrawCardFn` `freezeCardFn` `terminateCardFn` `updateCardFn` `revealCardFn` `cardTransactionsFn` | virtual cards (`/v1/cards`) |
 | `fileDisputeFn` / `sendSupportMessage` | disputes and support |
+| `adminStatus` `adminListFees` `adminSaveFee` `adminDeleteFee` | fee schedule management (admins only, see below) |
 
 Other routes: `GET /health`, `POST /api/webhooks/freda` (signed by Freda, no token).
 
@@ -44,6 +44,23 @@ Other routes: `GET /health`, `POST /api/webhooks/freda` (signed by Freda, no tok
   `pending`. A background loop (every 30 s) re-checks pending deposits, withdrawals and card
   creations with Freda and settles them, so webhooks are optional.
 - Payout references are reused on retry, which Freda treats as idempotent (no double payment).
+
+## Fees (KASHOPAY LLC billing)
+
+Fees are rows of the `fee_rules` table (migration `supabase/migrations/20261021000000_fee_rules.sql`), not environment variables, so the admin page can change them. Defaults:
+
+| Operation | Fee |
+| --- | --- |
+| Card creation (`card_creation`) | $10.00 |
+| Wallet top-up (`wallet_deposit`) | $5-10: $0.80 · $10-25: $1.15 · $25-50: $1.50 · $50-100: $2.00 |
+| Wallet withdrawal (`wallet_withdrawal`) | $5-10: $0.70 · $10-25: $1.00 · $25-50: $1.25 · $50-100: $1.75 |
+| Virtual card top-up (`card_fund`) | $2.30 |
+| Virtual card withdrawal (`card_withdraw`) | $2.15 |
+| Kasho to Kasho transfer (`transfer`) | 1.5 % per transaction |
+
+Who pays: top-up fee is kept from the amount credited (pay $10, wallet gets $10 - fee); withdrawal, card top-up and transfer fees are added on top (the wallet pays amount + fee); the card withdrawal fee is taken from the amount moved back to the wallet. Closing a card returns its balance without a fee. Brackets match when `min <= amount <= max`; a shared boundary ($10) belongs to the lower bracket. Top-ups and withdrawals outside the brackets ($5-$100) are refused. Fees are re-read on every request, so a change applies immediately. `getPublicConfig` returns the schedule (`fees`) for the app.
+
+Admin page API: add yourself once in the SQL editor (`insert into public.admins (user_id) values ('<auth user uuid>');`), then call `adminListFees`, `adminSaveFee` (create when no `id`, otherwise update; sends `confirmPassword`) and `adminDeleteFee`. The server validates brackets (no overlap, one fee for non-bracket operations).
 
 ## Cards and KYC
 
@@ -79,3 +96,12 @@ Run `supabase/migrations/20261009010000_card_code.sql` (or `kasho-pay-card-code.
 ## Deploy on Render
 
 Create a **Web Service**, language **Node**, repo root = this folder (leave Root Directory empty). Build command `npm install`, start command `npm start`. Enter the variables from `.env.example` in Environment (do not set PORT; set NODE_ENV=production). `package.json` must be at the root of the repository.
+
+## Latest hardening (migration `20261021020000_remaining_fixes.sql`, run it after the previous ones)
+- Admin (fees) endpoints need a verified 2FA factor and an aal2 session; fee caps: flat <= $100, percent <= 20.
+- `ENFORCE_MFA_ALL` now defaults to `true`: a user with a verified TOTP factor must pass the 2FA code (aal2) for all money / personal-data endpoints. Refusals are always HTTP 403 `{ error: { code: "MFA_REQUIRED" } }`; the app asks for the code and retries.
+- `getIdentity` needs `confirmPassword` in the request body (password step-up).
+- `sendMoney` accepts an optional `idempotencyKey` (8-64 chars `A-Za-z0-9_-`, one per send). A retry with the same key returns the original `reference` and never sends twice. Needs the migration (`transactions.idempotency_key`, 7-argument `kasho_transfer`).
+- Pending money is now recovered automatically: an ambiguous `card_fund` is replayed (same Freda `reference`) for 24 h, a card creation without a Freda card id is replayed with the same `reference`. Underpaid deposits are not credited, are flagged `meta.underpaid / needs_refund` and logged.
+- `changePassword` signs out all other sessions of the user.
+- Legacy `kyc-documents` storage policies dropped (the backend only uses the private `kyc-docs` bucket).

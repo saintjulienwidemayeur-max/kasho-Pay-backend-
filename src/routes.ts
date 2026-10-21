@@ -5,11 +5,15 @@ import * as L from "./ledger.js";
 import { readCardDetails } from "./ledger.js";
 import { freda, FredaError, fredaConfigured, fredaMode, pickArray, pickId } from "./freda.js";
 import { getConfig, normalizeHaitiPhone, round2 } from "./config.js";
+import { FEE_OPERATIONS, TIERED_OPERATIONS, amountRange, computeFee, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import { decryptField, encryptField, hashCardCode, verifyCardCode } from "./crypto.js";
 import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup.js";
-import { createSession, diditConfigured, getDecision, mapStatus, DiditError } from "./didit.js";
+import { cardCodeAttemptAllowed, resetCardCodeAttempts } from "./cardcode.js";
+import { createSession, diditConfigured, getDecision, mapStatus } from "./didit.js";
 
-export type Ctx = { userId: string; email: string; ip: string | null; ua: string | null; token?: string };
+export type Ctx = { userId: string; email: string; ip: string | null; ua: string | null; token?: string;
+  /** The user has a verified TOTP factor. */ mfa?: boolean;
+  /** Assurance level of the access token ("aal2" = 2FA code passed in this session). */ aal?: "aal1" | "aal2" };
 type Handler = { schema: z.ZodTypeAny; run: (d: any, c: Ctx) => Promise<unknown> };
 
 const provider = z.enum(["moncash", "natcash"]);
@@ -68,7 +72,7 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
       // Freda says this identity already exists (created earlier under another e-mail): reuse that enrolled holder.
       id = await L.findEnrolledHolderByName(d.firstName, d.lastName, c.userId);
       if (!id) {
-        console.error("[holder] Freda reports a duplicate identity but no enrolled holder could be matched for", d.email);
+        console.error("[holder] Freda reports a duplicate identity but no enrolled holder could be matched.");
         throw new L.AppError("We could not activate your card profile. Please contact support.");
       }
     }
@@ -106,22 +110,127 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
   };
 }
 
+export const ADMIN_MFA_MESSAGE = "Turn on two-factor authentication to manage fees.";
+
+/** Admin access also needs a verified TOTP factor AND an aal2 session (2FA code passed in this session). */
+export function adminMfaOk(c: Pick<Ctx, "mfa" | "aal">): boolean {
+  return c.mfa === true && c.aal === "aal2";
+}
+
+/** Only users listed in the `admins` table (server-only) may change fees, and only with 2FA. */
+async function requireAdmin(c: Ctx) {
+  if (!adminMfaOk(c)) throw new L.AppError(ADMIN_MFA_MESSAGE);
+  const { data } = await L.db.from("admins").select("user_id").eq("user_id", c.userId).maybeSingle();
+  if (!data) throw new L.AppError("You do not have access to this.");
+}
+
+/** Text of a Freda error body, only for matching (never logged or shown). */
+const rawText = (raw: unknown) => { try { return JSON.stringify(raw ?? ""); } catch { return ""; } };
+
+/** Client-chosen key that makes a send retry-safe: 8-64 chars, letters, digits, "_" and "-". */
+export const idempotencyKey = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
+
+/** True when a stored transfer_out row is the same transfer (same recipient and amount) as the one being requested. */
+export function sameTransfer(prev: { amount: unknown; counterparty_id: unknown }, toId: string, amount: number): boolean {
+  return prev.counterparty_id === toId && Math.abs(Math.abs(Number(prev.amount)) - amount) < 0.005;
+}
+
+const feeRuleInput = z.object({
+  id: z.string().uuid().optional(),
+  operation: z.enum(FEE_OPERATIONS),
+  label: z.string().trim().max(80).default(""),
+  feeType: z.enum(["flat", "percent"]),
+  minAmount: z.number().min(0).max(100000).nullable().default(null),
+  maxAmount: z.number().min(0).max(100000).nullable().default(null),
+  feeValue: z.number().min(0).max(100000),
+  active: z.boolean().default(true),
+});
+
 export const handlers: Record<string, Handler> = {
   // ---------------------------------------------------------------- config
   getPublicConfig: {
     schema: z.object({}).passthrough(),
     run: async () => {
       const c = getConfig();
+      const rules = await L.feeRules();
+      // Brackets of top-ups and withdrawals also set the amount range users can enter.
+      const dep = amountRange(rules, "wallet_deposit");
+      const wd = amountRange(rules, "wallet_withdrawal");
       return {
         htgPerUsd: c.htgPerUsd,
-        withdrawFeePercent: c.withdrawFeePercent,
-        cardCreationFeeUsd: c.cardCreationFeeUsd,
-        minDepositUsd: c.minDepositUsd,
-        minWithdrawUsd: c.minWithdrawUsd,
+        // The fee schedule shown in the app (the server recomputes every fee itself when money moves).
+        fees: rules.map(({ operation, feeType, minAmount, maxAmount, feeValue }) => ({ operation, feeType, minAmount, maxAmount, feeValue })),
+        minDepositUsd: Math.max(c.minDepositUsd, dep?.min ?? 0),
+        maxDepositUsd: dep?.max ?? null,
+        minWithdrawUsd: Math.max(c.minWithdrawUsd, wd?.min ?? 0),
+        maxWithdrawUsd: wd?.max ?? null,
         minCardFundUsd: c.minCardFundUsd,
         requireKycForCards: c.requireKycForCards,
         sandbox: fredaConfigured() ? fredaMode() === "sandbox" : true,
       };
+    },
+  },
+
+  // ---------------------------------------------------------------- admin: fee schedule
+  adminStatus: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      const { data } = await L.db.from("admins").select("user_id").eq("user_id", c.userId).maybeSingle();
+      return { isAdmin: !!data };
+    },
+  },
+
+  /** Every fee rule, including inactive ones. */
+  adminListFees: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      await requireAdmin(c);
+      const { data, error } = await L.db.from("fee_rules").select("*").order("operation").order("min_amount", { nullsFirst: true });
+      if (error) throw error;
+      return { operations: FEE_OPERATIONS, tiered: TIERED_OPERATIONS, rules: (data ?? []).map(rowToRule) };
+    },
+  },
+
+  /** Creates a rule (no id) or updates one (id). Password is checked by the step-up middleware. */
+  adminSaveFee: {
+    schema: feeRuleInput.extend({ confirmPassword: z.string().optional() }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const { data: all, error: listErr } = await L.db.from("fee_rules").select("*");
+      if (listErr) throw listErr;
+      const others: FeeRule[] = (all ?? []).map(rowToRule);
+      const rule = {
+        ...(d.id ? { id: d.id } : {}), operation: d.operation as FeeOperation, feeType: d.feeType,
+        minAmount: d.minAmount, maxAmount: d.maxAmount, feeValue: Math.round(d.feeValue * 10000) / 10000, active: d.active,
+      };
+      if (d.id && !others.some((o) => o.id === d.id)) throw new L.AppError("Fee rule not found.");
+      const problem = validateRule(rule, others);
+      if (problem) throw new L.AppError(problem);
+      const row = {
+        operation: rule.operation, label: d.label, fee_type: rule.feeType, min_amount: rule.minAmount, max_amount: rule.maxAmount,
+        fee_value: rule.feeValue, active: rule.active, updated_by: c.userId,
+      };
+      const { data, error } = d.id
+        ? await L.db.from("fee_rules").update(row).eq("id", d.id).select("*").single()
+        : await L.db.from("fee_rules").insert(row).select("*").single();
+      if (error) throw error;
+      await L.db.from("activity_log").insert({
+        user_id: c.userId, event: "Fee rule changed", detail: `${rule.operation} ${rule.feeType} ${rule.feeValue} [${rule.minAmount ?? ""}-${rule.maxAmount ?? ""}] active=${rule.active}`,
+        ip: c.ip, user_agent: c.ua,
+      });
+      return rowToRule(data);
+    },
+  },
+
+  adminDeleteFee: {
+    schema: z.object({ id: z.string().uuid(), confirmPassword: z.string().optional() }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const { data, error } = await L.db.from("fee_rules").delete().eq("id", d.id).select("operation");
+      if (error) throw error;
+      if (!data?.length) throw new L.AppError("Fee rule not found.");
+      await L.db.from("activity_log").insert({ user_id: c.userId, event: "Fee rule deleted", detail: String(data[0].operation), ip: c.ip, user_agent: c.ua });
+      return { ok: true };
     },
   },
 
@@ -168,6 +277,16 @@ export const handlers: Record<string, Handler> = {
       if (d.newPassword === d.currentPassword) throw new L.AppError("Choose a new password different from the current one.");
       const { error } = await L.db.auth.admin.updateUserById(c.userId, { password: d.newPassword });
       if (error) throw new L.AppError(error.message.includes("weak") ? "That password is too weak." : "Could not update the password.");
+      // Revoke every OTHER session (stolen / forgotten devices); the current one keeps working. Already issued access
+      // tokens of those sessions stay valid until they expire (<= 1 h by default), but they can no longer be refreshed.
+      if (c.token) {
+        try {
+          const { error: outErr } = await L.db.auth.admin.signOut(c.token, "others");
+          if (outErr) console.error("[password] could not revoke other sessions:", outErr.message);
+        } catch (e) {
+          console.error("[password] could not revoke other sessions:", (e as Error).message);
+        }
+      }
       await L.notify(c.userId, "Password changed", "Your password was changed. If this was not you, contact support now.");
       return { ok: true };
     },
@@ -181,7 +300,7 @@ export const handlers: Record<string, Handler> = {
       const { data: p } = await L.db.from("profiles").select("kyc_status").eq("id", c.userId).single();
       if (p?.kyc_status === "verified") throw new L.AppError("Your identity is already verified.");
       const front = (process.env["FRONTEND_URL"] ?? "http://localhost:5173").replace(/\/+$/, "");
-      try {
+      {
         const s = await createSession({ userId: c.userId, callback: `${front}/kyc` });
         // Didit can hand back the same session when the user comes back to continue: reuse its row instead of inserting a duplicate.
         const { data: existing } = await L.db.from("kyc_submissions").select("id, reference, user_id")
@@ -200,9 +319,6 @@ export const handlers: Record<string, Handler> = {
         }
         await L.db.from("profiles").update({ kyc_status: "pending", kyc_reference: reference }).eq("id", c.userId);
         return { url: s.url, reference };
-      } catch (e) {
-        if (e instanceof DiditError) throw new L.AppError(e.message);
-        throw e;
       }
     },
   },
@@ -212,12 +328,8 @@ export const handlers: Record<string, Handler> = {
       const { data: sub } = await L.db.from("kyc_submissions").select("didit_session_id").eq("user_id", c.userId)
         .not("didit_session_id", "is", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
       if (!sub?.didit_session_id) return { status: "unverified" };
-      try {
-        return { status: await L.applyKycDecision(sub.didit_session_id, c.userId) };
-      } catch (e) {
-        if (e instanceof DiditError) throw new L.AppError(e.message);
-        throw e;
-      }
+      // DiditError is mapped to a generic user message by toUserError (details stay in the server log).
+      return { status: await L.applyKycDecision(sub.didit_session_id, c.userId) };
     },
   },
 
@@ -228,13 +340,16 @@ export const handlers: Record<string, Handler> = {
       const cfg = getConfig();
       const amountUsd = round2(d.amountUsd);
       if (amountUsd < cfg.minDepositUsd) throw new L.AppError(`Minimum deposit is $${cfg.minDepositUsd}.`);
+      // The user pays the full amount through MonCash / NatCash; the fee is kept from what is credited to the wallet.
+      const fee = computeFee(await L.feeRules(), "wallet_deposit", amountUsd);
+      if (fee >= amountUsd) throw new L.AppError("That amount is too small to cover the fee.");
       const amountHtg = Math.ceil(amountUsd * cfg.htgPerUsd);
       const name = providerName(d.provider);
       const phone = d.phone ? normalizeHaitiPhone(d.phone) : null;
 
       const tx = await L.insertTx({
         user_id: c.userId, kind: "deposit", title: `Top-up via ${name}`, category: "Top-up", method: name,
-        amount: amountUsd, fee: 0, status: "pending", provider: "freda",
+        amount: amountUsd, fee, status: "pending", provider: "freda",
         meta: { provider: d.provider, amount_htg: amountHtg, rate: cfg.htgPerUsd },
       });
       try {
@@ -244,9 +359,12 @@ export const handlers: Record<string, Handler> = {
           amount: amountHtg, method, reference: tx.reference, ...(method === "moncash_ussd" ? { phone: phone! } : {}),
         });
         await L.patchTx(tx.id, { provider_ref: payment.id, meta: { ...tx.meta, method } });
-        return { transactionId: tx.id as string, checkoutUrl: (payment.checkout_url ?? null) as string | null, amountHtg, ussd: method === "moncash_ussd" };
+        return { transactionId: tx.id as string, checkoutUrl: (payment.checkout_url ?? null) as string | null, amountHtg, ussd: method === "moncash_ussd", fee };
       } catch (e) {
-        await L.failTx(tx.id, "Could not start payment");
+        // Unknown outcome (timeout, 5xx): the payment may exist on Freda and be paid later. Closing the row now would
+        // make the webhook ignore that payment (user pays, wallet never credited), so leave it pending: the webhook
+        // settles it, or the reconcile loop expires it after 24h. No wallet money was reserved for a deposit.
+        if (!(e instanceof FredaError && e.ambiguous)) await L.failTx(tx.id, "Could not start payment");
         throw e;
       }
     },
@@ -271,7 +389,7 @@ export const handlers: Record<string, Handler> = {
       const recipient = normalizeHaitiPhone(d.phone);
       if (!recipient) throw new L.AppError("Enter a valid MonCash or NatCash number (e.g. 509 3700 1234).");
 
-      const fee = round2((amountUsd * cfg.withdrawFeePercent) / 100);
+      const fee = computeFee(await L.feeRules(), "wallet_withdrawal", amountUsd);
       const amountHtg = Math.floor(amountUsd * cfg.htgPerUsd);
       const name = providerName(d.provider);
 
@@ -283,7 +401,7 @@ export const handlers: Record<string, Handler> = {
       // 1) reserve the money atomically (throws INSUFFICIENT_FUNDS if the wallet is short)
       const txId = await L.debit({
         user: c.userId, kind: "withdrawal", title: `Withdrawal to ${name}`, category: "Withdrawal", method: name,
-        amount: amountUsd, fee, status: "pending",
+        amount: amountUsd, fee, status: "pending", dailyLimit: cfg.dailyWithdrawLimitUsd, // re-checked atomically with the debit
         meta: { provider: d.provider, recipient, amount_htg: amountHtg, rate: cfg.htgPerUsd },
       });
       const tx = await L.getTx(txId);
@@ -330,25 +448,52 @@ export const handlers: Record<string, Handler> = {
   },
 
   sendMoney: {
-    schema: z.object({ username: z.string().min(2).max(40), amountUsd: z.number().positive().max(5000), note: z.string().max(140).optional() }),
+    schema: z.object({
+      username: z.string().min(2).max(40), amountUsd: z.number().positive().max(5000), note: z.string().max(140).optional(),
+      /** Random key the app generates once per send (8-64 chars). A retry with the same key never sends twice. */
+      idempotencyKey: idempotencyKey.optional(),
+    }),
     run: async (d, c) => {
       const username = d.username.toLowerCase().replace(/^@/, "");
       const { data: target } = await L.db.from("profiles").select("id, display_name, username").eq("username", username).maybeSingle();
       if (!target) throw new L.AppError("We could not find that Kasho user.");
       const amount = round2(d.amountUsd);
+      const recipientName = (target.display_name || `@${target.username}`) as string;
+      // Retry of a transfer that already went through: answer with the original result, move no money, notify nobody.
+      const replay = async () => {
+        if (!d.idempotencyKey) return null;
+        const { data: prev } = await L.db.from("transactions").select("reference, amount, fee, counterparty_id")
+          .eq("user_id", c.userId).eq("idempotency_key", d.idempotencyKey).maybeSingle();
+        if (!prev) return null;
+        if (!sameTransfer(prev, target.id, amount)) throw new L.AppError("This request was already used for a different transfer. Please try again.");
+        return { reference: prev.reference as string, recipient: recipientName, fee: Number(prev.fee ?? 0) };
+      };
+      const earlier = await replay();
+      if (earlier) return earlier;
       const cfg = getConfig();
+      // The sender pays the amount plus the fee; the recipient receives the full amount.
+      const fee = computeFee(await L.feeRules(), "transfer", amount);
       if (cfg.dailyTransferLimitUsd > 0) {
         const used = await L.spentLast24h(c.userId, ["transfer_out"]);
         if (used + amount > cfg.dailyTransferLimitUsd) throw new L.AppError(`Daily transfer limit reached ($${cfg.dailyTransferLimitUsd} per 24 hours).`);
       }
       const { data: ref, error } = await L.db.rpc("kasho_transfer", {
-        p_from: c.userId, p_to: target.id, p_amount: amount, p_note: d.note ?? "",
+        p_from: c.userId, p_to: target.id, p_amount: amount, p_note: d.note ?? "", p_fee: fee,
+        p_daily_limit: cfg.dailyTransferLimitUsd, // re-checked atomically under the wallet lock
+        p_idempotency_key: d.idempotencyKey ?? null,
       });
-      if (error) throw error;
+      if (error) {
+        // Two parallel requests with the same key: the database accepted only one, answer with its result.
+        if (d.idempotencyKey && String(error.code) === "23505") {
+          const again = await replay();
+          if (again) return again;
+        }
+        throw error;
+      }
       const { data: me } = await L.db.from("profiles").select("display_name, username").eq("id", c.userId).single();
       await L.notify(target.id, "Money received", `${me?.display_name || "@" + me?.username} sent you $${amount.toFixed(2)}`);
-      await L.notify(c.userId, "Money sent", `$${amount.toFixed(2)} sent to ${target.display_name || "@" + target.username}`);
-      return { reference: ref as string, recipient: (target.display_name || `@${target.username}`) as string };
+      await L.notify(c.userId, "Money sent", `$${amount.toFixed(2)} sent to ${target.display_name || "@" + target.username}${fee > 0 ? ` (fee $${fee.toFixed(2)})` : ""}`);
+      return { reference: ref as string, recipient: recipientName, fee };
     },
   },
 
@@ -377,6 +522,7 @@ export const handlers: Record<string, Handler> = {
       const amount = round2(d.amountUsd);
       if (amount < cfg.minCardFundUsd) throw new L.AppError(`Minimum card funding is $${cfg.minCardFundUsd}.`);
       const label = d.label?.trim() || "Kasho virtual debit";
+      const fee = computeFee(await L.feeRules(), "card_creation", amount); // read before any holder / card is created
 
       const mode = fredaMode();
       // The customer never picks a card holder: the latest one for this account is used, or one is created automatically.
@@ -418,7 +564,7 @@ export const handlers: Record<string, Handler> = {
             const g: any = await freda.getHolder(holder.freda_holder_id);
             const h = g?.holder ?? g;
             if (!h?.status || String(h.status).toLowerCase() === "enrolled") holderFredaId = holder.freda_holder_id;
-            else console.error("[holder] stored holder", holder.freda_holder_id, "is", h.status, h.failure_reason ?? "");
+            else console.error("[holder] stored holder is not enrolled, status:", h.status);
           } catch (e) {
             console.error("[holder] could not read stored holder:", (e as Error).message);
           }
@@ -452,10 +598,10 @@ export const handlers: Record<string, Handler> = {
               identity,
             });
           } catch (e) {
-            if (e instanceof FredaError) console.error("[holder] identity upgrade rejected", e.status, e.code, e.message, "| raw:", JSON.stringify(e.raw ?? null));
+            if (e instanceof FredaError) console.error("[holder] identity upgrade rejected", e.status, e.code, e.message);
             // Freda's own provider answers "customer is already enrolled" when the holder is upgraded: the holder
             // exists and is usable, so carry on to the card request (a failure there is refunded automatically).
-            if (!(e instanceof FredaError && /already enrolled/i.test(`${e.message} ${JSON.stringify(e.raw ?? "")}`))) throw e;
+            if (!(e instanceof FredaError && /already enrolled/i.test(`${e.message} ${rawText(e.raw)}`))) throw e;
           }
           await L.db.from("card_holders").update({ identity_sent: true }).eq("id", holder.id);
         }
@@ -466,11 +612,10 @@ export const handlers: Record<string, Handler> = {
 
       const cardId = crypto.randomUUID();
       const reference = `kasho_card_${cardId}`;
-      const fee = cfg.cardCreationFeeUsd;
 
       const txId = await L.debit({
         user: c.userId, kind: "card_creation", title: `New card: ${label}`, category: "Card", method: "Wallet",
-        amount, fee, status: "pending", meta: { label },
+        amount, fee, status: "pending", meta: { label, holder_id: holderFredaId },
       });
       const { error: insErr } = await L.db.from("cards").insert({
         id: cardId, user_id: c.userId, reference, label, color: d.color, brand: d.brand, status: "pending", creation_tx_id: txId,
@@ -488,7 +633,7 @@ export const handlers: Record<string, Handler> = {
         try {
           res = await freda.createCard(cardReq);
         } catch (e) {
-          if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", JSON.stringify(cardReq), "mode:", mode, "->", e.status, e.code, e.message, "| raw:", JSON.stringify(e.raw ?? null));
+          if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);
           throw e;
         }
         await L.db.from("cards").update({ freda_card_id: res.id ?? null }).eq("id", cardId);
@@ -524,16 +669,18 @@ export const handlers: Record<string, Handler> = {
       if (card.status !== "active" || !card.freda_card_id) throw new L.AppError("This card is not active.");
       const amount = round2(d.amountUsd);
       if (amount < cfg.minCardFundUsd) throw new L.AppError(`Minimum is $${cfg.minCardFundUsd}.`);
+      const fee = computeFee(await L.feeRules(), "card_fund", amount); // the card receives `amount`, the wallet pays amount + fee
 
       const txId = await L.debit({
         user: c.userId, kind: "card_fund", title: `Added to ${card.label}`, category: "Card",
-        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, card: card.id,
+        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee, card: card.id,
       });
       try {
-        await freda.fundCard(card.freda_card_id, amount);
+        // The ledger reference is the idempotency key, so a retry of the same request can never fund the card twice.
+        await freda.fundCard(card.freda_card_id, amount, (await L.getTx(txId)).reference);
       } catch (e) {
         if (e instanceof FredaError && e.ambiguous) {
-          // fund has no idempotency key: never auto-refund an unknown outcome
+          // unknown outcome: never auto-refund
           await L.mergeTxMeta(await L.getTx(txId), { needs_review: true });
         } else {
           await L.failTx(txId, "Provider rejected the funding");
@@ -552,6 +699,9 @@ export const handlers: Record<string, Handler> = {
       const card = await L.getOwnedCard(c.userId, d.cardId);
       if (card.status !== "active" || !card.freda_card_id) throw new L.AppError("This card is not active.");
       const amount = round2(d.amountUsd);
+      // `amount` leaves the card; the wallet is credited amount - fee (kasho_complete_tx).
+      const fee = computeFee(await L.feeRules(), "card_withdraw", amount);
+      if (amount <= fee) throw new L.AppError(`The amount must be more than the $${fee.toFixed(2)} fee.`);
       // Real balance on Freda, read before anything moves. It is the reference used to recover from a crash.
       const before = readCardDetails(await freda.getCard(card.freda_card_id)).balance;
       if (before === undefined) throw new L.AppError("Could not read the card balance. Try again.");
@@ -560,11 +710,11 @@ export const handlers: Record<string, Handler> = {
       // The ledger row exists BEFORE the provider call: if the server dies in between, reconcile() settles it.
       const tx = await L.insertTx({
         user_id: c.userId, kind: "card_withdraw", title: `Moved from ${card.label}`, category: "Card",
-        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee: 0, status: "pending", card_id: card.id, provider: "freda",
+        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee, status: "pending", card_id: card.id, provider: "freda",
         meta: { freda_balance_before: before },
       });
       try {
-        await freda.withdrawCard(card.freda_card_id, amount);
+        await freda.withdrawCard(card.freda_card_id, amount, tx.reference);
       } catch (e) {
         // Ambiguous (timeout/5xx): leave it pending, the reconcile loop compares balances and settles it.
         if (!(e instanceof FredaError && e.ambiguous)) await L.failTx(tx.id, "Provider rejected the withdrawal");
@@ -637,7 +787,12 @@ export const handlers: Record<string, Handler> = {
         if (!(e instanceof FredaError && e.status === 404)) throw e; // 404 = card no longer exists = closed
       }
       await L.db.from("cards").update({ status: "terminated", balance: 0 }).eq("id", card.id);
-      if (tx) await L.completeTx(tx.id);
+      // A parallel terminate request (double click) must not credit the same balance twice: only the oldest
+      // closing row of this card is credited, the others are closed without moving money.
+      if (tx) {
+        if (await L.hasOlderTerminateTx(card.id, tx)) await L.failTx(tx.id, "Card already closed by another request");
+        else await L.completeTx(tx.id);
+      }
       await L.notify(c.userId, "Card closed", `${card.label} was closed permanently.`);
       return { refunded: remaining };
     },
@@ -674,6 +829,7 @@ export const handlers: Record<string, Handler> = {
       if (error) throw error;
       await L.db.from("profiles").update({ card_code_set: true }).eq("id", c.userId);
       clearStepUpFailures(`code:${c.userId}`);
+      await resetCardCodeAttempts(L.db, c.userId);
       return { ok: true };
     },
   },
@@ -686,11 +842,14 @@ export const handlers: Record<string, Handler> = {
       // 5 wrong codes lock card details for 15 minutes (a 4-digit code has only 10,000 possibilities).
       const lockKey = `code:${c.userId}`;
       if (stepUpLocked(lockKey)) throw new L.AppError("Too many wrong codes. Try again in 15 minutes.");
+      // Shared, restart-proof counter (in the database): each guess uses one of 5 attempts before it is checked.
+      if (!(await cardCodeAttemptAllowed(L.db, c.userId))) throw new L.AppError("Too many wrong codes. Try again in 15 minutes.");
       if (!verifyCardCode(d.code, row.code_hash)) {
         recordStepUpFailure(lockKey);
         throw new L.AppError("Incorrect code.");
       }
       clearStepUpFailures(lockKey);
+      await resetCardCodeAttempts(L.db, c.userId);
       const card = await L.getOwnedCard(c.userId, d.cardId);
       if (card.status !== "active" || !card.freda_card_id) throw new L.AppError("This card is not active.");
       const r: any = await freda.revealCard(card.freda_card_id);

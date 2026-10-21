@@ -28,12 +28,22 @@ Run the unit tests: `npm test`. Run the live probes against a running server: `n
 - Nothing was tested against the real Freda or Supabase APIs.
 
 ## Added in this round
-- Step-up: revealing a card, withdrawing to MonCash/NatCash and changing the password require the account password (re-checked by the server against Supabase, 5 wrong tries lock it for 15 minutes). If the user enabled 2FA (TOTP), the session must also be `aal2`, otherwise the server answers `MFA_REQUIRED`.
+- Step-up: revealing a card, withdrawing to MonCash/NatCash, changing the password and reading the ID number (`getIdentity`) require the account password (re-checked by the server against Supabase, 5 wrong tries lock it for 15 minutes). If the user enabled 2FA (TOTP), the session must also be `aal2`, otherwise the server answers `MFA_REQUIRED`.
 - Password change now goes through the server (`changePassword`), so the check cannot be skipped from the browser.
 - ID numbers are encrypted with AES-256-GCM (`DATA_ENCRYPTION_KEY`) before being stored. Existing rows: run `npm run encrypt:existing` once. Back up the key: without it the values are unrecoverable.
 - Card withdrawals and card closures write the ledger row BEFORE calling Freda and record the card balance seen at that moment. If the server dies in between, the reconcile loop compares the real Freda balance (or card status) with it: money moved -> wallet credited once; nothing moved after 10 minutes -> closed without credit. No manual step.
 - `npm run webhook:register -- https://<public-url>` registers the Freda webhook (`POST /v1/webhooks`) and prints the `whsec_` secret.
 - Old manual KYC upload (`submitKyc`) removed: less attack surface.
+
+## Added in the remaining-fixes round (migration `20261021020000_remaining_fixes.sql`)
+- Admin fee endpoints: the admin must have a verified TOTP factor AND an aal2 session ("Turn on two-factor authentication to manage fees."). Fee rules are capped (flat <= $100, percent <= 20).
+- `ENFORCE_MFA_ALL` defaults to TRUE. Users with a verified TOTP factor need an aal2 session for every endpoint in `MFA_ENDPOINTS`; the refusal is always HTTP 403 with `code: "MFA_REQUIRED"`. Users without 2FA are unaffected (except admins). Set `ENFORCE_MFA_ALL=false` to disable.
+- `getIdentity` (returns the decrypted ID number) needs the password re-check: the frontend must send `confirmPassword`.
+- Error and log hygiene: unknown Freda codes and Didit errors give generic user messages (fixed allow-list of known codes only); the "insufficient funds" shortcut applies only to the payer's mobile-money case, never to platform or card balances; logs never contain Freda request/response bodies, e-mails or identity data (code, status and message only).
+- `sendMoney` idempotency key (unique per user in the database): a retried request cannot send twice.
+- Stuck pending money: ambiguous card fundings and card creations are replayed with the same Freda `reference` (idempotent) by the reconcile loop; fundings older than 24 h stay flagged `needs_review` and are logged hourly. Underpaid deposits are never credited: `meta` gets `underpaid`, `paid_htg`, `expected_htg`, `needs_refund`; support must refund by hand (query: `select * from transactions where meta->>'needs_refund' = 'true'`).
+- `changePassword` revokes the user's other sessions (`auth.admin.signOut(token, "others")`). Access tokens already issued to those sessions stay valid until they expire (default 1 h) but cannot be refreshed.
+- Legacy `kyc-documents` storage policies removed. `package-lock.json` is committed; `npm audit` reports 0 vulnerabilities.
 
 ## Still missing before real customers
 1. Rotate every key that was pasted in chat (Supabase service role, Freda secret, Didit key).

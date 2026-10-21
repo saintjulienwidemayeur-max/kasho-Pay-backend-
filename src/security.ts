@@ -92,3 +92,19 @@ export function makeOriginCheck(allowed: string[], allowLan: boolean) {
   const lan = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d+)?$/;
   return (origin: string | undefined): boolean => !origin || allowed.includes(origin) || (allowLan && lan.test(origin));
 }
+
+// ------------------------------------------------------------ outbound fetch guard (SSRF)
+/**
+ * Only fetch https URLs that point at a public host name: no credentials, no custom port, no IP literals,
+ * no localhost / internal names. The URLs come from a third party API (Didit), so this is defense in depth.
+ */
+export function isSafeRemoteUrl(raw: unknown): raw is string {
+  if (typeof raw !== "string" || raw.length > 2048) return false;
+  let u: URL;
+  try { u = new URL(raw); } catch { return false; }
+  if (u.protocol !== "https:" || u.username || u.password || (u.port && u.port !== "443")) return false;
+  const h = u.hostname.toLowerCase();
+  if (!h.includes(".") || h.startsWith("[") || /^[\d.]+$/.test(h)) return false; // IPv6 / IPv4 literals, single-label names
+  if (/(^|\.)(localhost|local|internal|localdomain|lan|home|corp|intranet)$/.test(h)) return false;
+  return true;
+}

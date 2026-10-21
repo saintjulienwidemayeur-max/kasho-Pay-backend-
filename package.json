@@ -9,7 +9,7 @@
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
-    "test": "node --import tsx --test scripts/security.test.ts",
+    "test": "node --import tsx --test scripts/security.test.ts scripts/fees.test.ts scripts/hardening.test.ts scripts/remaining.test.ts",
     "webhook:register": "tsx scripts/register-webhook.ts",
     "encrypt:existing": "tsx scripts/encrypt-existing.ts"
   },

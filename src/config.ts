@@ -1,4 +1,5 @@
 // Business rules, read from environment variables (see .env).
+// Fees are not here: they live in the fee_rules table (see fees.ts).
 function num(name: string, fallback: number): number {
   const v = Number(process.env[name]);
   return Number.isFinite(v) && v >= 0 ? v : fallback;
@@ -7,8 +8,6 @@ function num(name: string, fallback: number): number {
 export function getConfig() {
   return {
     htgPerUsd: num("HTG_PER_USD", 131) || 131,
-    withdrawFeePercent: num("WITHDRAW_FEE_PERCENT", 5),
-    cardCreationFeeUsd: num("CARD_CREATION_FEE_USD", 0),
     minDepositUsd: num("MIN_DEPOSIT_USD", 1),
     minWithdrawUsd: num("MIN_WITHDRAW_USD", 1),
     minCardFundUsd: num("MIN_CARD_FUND_USD", 1),

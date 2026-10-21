@@ -107,8 +107,12 @@ export const freda = {
     call("POST", "/v1/cards", b),
   getCard: (id: string) => call("GET", `/v1/cards/${encodeURIComponent(id)}`),
   cardTransactions: (id: string) => call("GET", `/v1/cards/${encodeURIComponent(id)}/transactions?page_size=50`),
-  fundCard: (id: string, amount: number) => call("POST", `/v1/cards/${encodeURIComponent(id)}/fund`, { amount }),
-  withdrawCard: (id: string, amount: number) => call("POST", `/v1/cards/${encodeURIComponent(id)}/withdraw`, { amount }),
+  // `reference` is Freda's idempotency key (max 64 chars: letters, digits . _ : -). Replaying the same key after a
+  // timeout does not move the money twice (the answer has `idempotent_replay: true`); another amount gives 409 IDEMPOTENCY_MISMATCH.
+  fundCard: (id: string, amount: number, reference?: string) =>
+    call("POST", `/v1/cards/${encodeURIComponent(id)}/fund`, { amount, ...(reference ? { reference } : {}) }),
+  withdrawCard: (id: string, amount: number, reference?: string) =>
+    call("POST", `/v1/cards/${encodeURIComponent(id)}/withdraw`, { amount, ...(reference ? { reference } : {}) }),
   freezeCard: (id: string) => call("POST", `/v1/cards/${encodeURIComponent(id)}/freeze`),
   unfreezeCard: (id: string) => call("POST", `/v1/cards/${encodeURIComponent(id)}/unfreeze`),
   terminateCard: (id: string) => call("POST", `/v1/cards/${encodeURIComponent(id)}/terminate`),

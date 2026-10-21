@@ -37,7 +37,7 @@ async function call(method: "GET" | "POST", path: string, body?: unknown): Promi
   let json: any = null;
   try { json = text ? JSON.parse(text) : null; } catch { /* not json */ }
   if (!res.ok) {
-    console.error("[didit]", res.status, path, text.slice(0, 300));
+    console.error("[didit]", res.status, path); // status only: the body can hold identity data
     throw new DiditError(res.status, json?.detail ?? json?.message ?? "Verification service error.");
   }
   return json;
