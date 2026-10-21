@@ -2,8 +2,10 @@
 // Freda operations, card synchronisation and user-facing error mapping.
 import { supabaseAdmin } from "./supabase.js";
 import { FredaError, freda, fredaMode, pickArray, pickId } from "./freda.js";
+import { round2 } from "./config.js";
 import { FeeError, loadFeeRules, type FeeRule } from "./fees.js";
 import { isSafeRemoteUrl } from "./security.js";
+import { DiditError } from "./didit.js";
 
 // supabaseAdmin is intentionally loosely typed here (rpc results, jsonb meta).
 export const db: any = supabaseAdmin;
@@ -13,60 +15,67 @@ export class AppError extends Error {}
 
 const UNAVAILABLE = "This service is temporarily unavailable. Please try again later.";
 
+/** Freda codes that are about OUR account (keys, balances, limits): users only see "unavailable". */
+const PLATFORM_CODES = new Set([
+  "NOT_CONFIGURED", "MISSING_API_KEY", "INVALID_API_KEY", "LIVE_NOT_ENABLED", "LIVE_NOT_ALLOWED", "ISSUING_LIVE_NOT_ENABLED",
+  "INSUFFICIENT_BALANCE", "BELOW_MINIMUM_BALANCE", "CARD_LIMIT_REACHED", "ACCOUNT_SUSPENDED", "MERCHANT_NOT_FOUND",
+  "CARD_PROVIDER_AUTH", "CARD_LIVE_NOT_CONFIGURED", "CARD_SERVICE_ERROR", "IDEMPOTENCY_MISMATCH",
+]);
+
+/** Safe, fixed user messages for the other known codes. Raw Freda text is never shown to users. */
+const FREDA_USER_MESSAGES: Record<string, string> = {
+  INVALID_RECIPIENT: "Enter a valid MonCash or NatCash number (e.g. 509 3700 1234).",
+  INVALID_AMOUNT: "Enter a valid amount.",
+  HOLDER_PROFILE_REQUIRED: "We could not verify your card profile. Please check your profile details (name, phone, address) and try again.",
+  HOLDER_PROFILE_INCOMPLETE: "We could not verify your card profile. Please check your profile details (name, phone, address) and try again.",
+  HOLDER_NOT_ENROLLED: "We could not verify your card profile. Please check your profile details (name, phone, address) and try again.",
+  HOLDER_MODE_MISMATCH: "We could not verify your card profile. Please check your profile details (name, phone, address) and try again.",
+  HOLDER_CREATION_FAILED: "We could not verify your card profile. Please check your profile details (name, phone, address) and try again.",
+  CARD_FROZEN: "This card is frozen. Unfreeze it first.",
+  CARD_NOT_READY: "Your card is not active yet. Please try again in a few seconds.",
+  INSUFFICIENT_CARD_BALANCE: "That is more than the card balance.",
+  AMOUNT_BELOW_FEE: "That amount is too small. Please try a larger amount.",
+  AMOUNT_TOO_LOW: "That amount is too small. Please try a larger amount.",
+  RATE_LIMITED: "Too many requests. Please wait a minute and try again.",
+  NETWORK: "The payment network did not respond. Please try again in a moment.",
+  PROVIDER_ERROR: "The payment network did not respond. Please try again in a moment.",
+  NOT_FOUND: "We could not find this item. Refresh and try again.",
+  // Small allow-list of other safe user-facing codes (fixed text, not Freda's).
+  INVALID_BRAND: "That card type is not available. Choose another one.",
+  INVALID_PHOTO: "We could not use your ID photo. Please verify your identity again.",
+  MISSING_FIELDS: "Some details are missing. Please complete your profile and try again.",
+  INDIVIDUAL_CARD_DETAILS_HIDDEN: "Card details are not available for this card.",
+};
+const GENERIC_FREDA = "We could not complete this request. Please try again or contact support.";
+
+/** Codes a payment can come back with when the payer's mobile money account is short of funds. */
+const PAYER_FUNDS_CODES = new Set(["INSUFFICIENT_FUNDS", "PAYMENT_FAILED", "PROVIDER_ERROR"]);
+
+/** True only for the payment-time "the payer's mobile money account has too little money" case (never platform balances). */
+export function isPayerInsufficientFunds(e: { code: string; status: number; message: string }): boolean {
+  if (PLATFORM_CODES.has(e.code) || e.code === "INSUFFICIENT_CARD_BALANCE") return false;
+  if (e.status >= 500 || !PAYER_FUNDS_CODES.has(e.code)) return false;
+  return e.code === "INSUFFICIENT_FUNDS" || /insufficient (funds|balance)/i.test(e.message);
+}
+
 export function toUserError(e: any): Error {
   if (e instanceof AppError) return e;
   if (e instanceof FeeError) return new AppError(e.message);
 
   if (e instanceof FredaError) {
-    console.error("[freda]", e.status, e.code, e.message);
-    if (/insufficient/i.test(e.message)) {
+    console.error("[freda]", e.status, e.code, e.message); // code/status/message only: never the body
+    if (isPayerInsufficientFunds(e)) {
       return new AppError("The balance on your mobile money account is too low for this payment. Add funds and try again.");
     }
-    switch (e.code) {
-      case "INVALID_RECIPIENT":
-        return new AppError("Enter a valid MonCash or NatCash number (e.g. 509 3700 1234).");
-      case "INVALID_AMOUNT":
-        return new AppError(e.message);
-      case "HOLDER_PROFILE_REQUIRED":
-      case "HOLDER_PROFILE_INCOMPLETE":
-      case "HOLDER_NOT_ENROLLED":
-      case "HOLDER_MODE_MISMATCH":
-      case "HOLDER_CREATION_FAILED":
-        return new AppError("We could not verify your card profile. Please check your profile details (name, phone, address) and try again.");
-      case "CARD_FROZEN":
-        return new AppError("This card is frozen. Unfreeze it first.");
-      case "CARD_NOT_READY":
-        return new AppError("Your card is not active yet. Please try again in a few seconds.");
-      case "INSUFFICIENT_CARD_BALANCE":
-        return new AppError("That is more than the card balance.");
-      case "AMOUNT_BELOW_FEE":
-      case "AMOUNT_TOO_LOW":
-        return new AppError("That amount is too small. Please try a larger amount.");
-      case "RATE_LIMITED":
-        return new AppError("Too many requests. Please wait a minute and try again.");
-      case "NETWORK":
-      case "PROVIDER_ERROR":
-        return new AppError("The payment network did not respond. Please try again in a moment.");
-      case "NOT_FOUND":
-        return new AppError("We could not find this item. Refresh and try again.");
-      // Platform-level problems (our Freda account, keys, balances). Do not leak details to users.
-      case "NOT_CONFIGURED":
-      case "MISSING_API_KEY":
-      case "INVALID_API_KEY":
-      case "LIVE_NOT_ENABLED":
-      case "ISSUING_LIVE_NOT_ENABLED":
-      case "INSUFFICIENT_BALANCE":
-      case "BELOW_MINIMUM_BALANCE":
-      case "CARD_LIMIT_REACHED":
-      case "ACCOUNT_SUSPENDED":
-      case "MERCHANT_NOT_FOUND":
-      case "CARD_PROVIDER_AUTH":
-      case "CARD_LIVE_NOT_CONFIGURED":
-      case "HOLDER_MODE_MISMATCH":
-        return new AppError(UNAVAILABLE);
-      default:
-        return new AppError(e.status >= 500 ? UNAVAILABLE : e.message);
-    }
+    if (PLATFORM_CODES.has(e.code)) return new AppError(UNAVAILABLE);
+    const known = Object.prototype.hasOwnProperty.call(FREDA_USER_MESSAGES, e.code) ? FREDA_USER_MESSAGES[e.code] : undefined;
+    if (known) return new AppError(known);
+    return new AppError(e.status >= 500 ? UNAVAILABLE : GENERIC_FREDA);
+  }
+
+  if (e instanceof DiditError) {
+    console.error("[didit]", e.status, e.message);
+    return new AppError("Identity verification is unavailable right now. Please try again later.");
   }
 
   const msg = String(e?.message ?? "");
@@ -76,7 +85,7 @@ export function toUserError(e: any): Error {
   if (msg.includes("INVALID_AMOUNT")) return new AppError("Enter a valid amount.");
   if (msg.includes("DAILY_LIMIT")) return new AppError("Daily limit reached. Please try again later.");
 
-  console.error("[kasho]", e);
+  console.error("[kasho]", String(e?.message ?? e).slice(0, 300));
   return new AppError("Something went wrong. Please try again.");
 }
 
@@ -140,6 +149,18 @@ export async function mergeTxMeta(tx: any, extra: Record<string, unknown>) {
   await patchTx(tx.id, { meta: { ...(tx.meta ?? {}), ...extra } });
 }
 
+/** True when a succeeded payment is smaller than the amount requested (0.001 tolerance). */
+export function isUnderpaid(paidHtg: unknown, expectedHtg: number): boolean {
+  return !!expectedHtg && typeof paidHtg === "number" && paidHtg + 0.001 < expectedHtg;
+}
+export const underpaidMeta = (paidHtg: number, expectedHtg: number) =>
+  ({ underpaid: true, paid_htg: paidHtg, expected_htg: expectedHtg, needs_refund: true });
+
+/** A card_fund whose Freda call had an unknown outcome may be replayed (same idempotency key) for this long. */
+export const REPLAY_WINDOW_MS = 24 * 3600 * 1000;
+/** Do not replay a card creation younger than this: the original request may still be running. */
+const CARD_REPLAY_MIN_AGE_MS = 60_000;
+
 const money = (n: number) => `$${Number(n).toFixed(2)}`;
 
 // ------------------------------------------------------------------ settlement
@@ -152,10 +173,14 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
     const p: any = await freda.getPayment(tx.provider_ref);
     if (p?.status === "succeeded") {
       const expectedHtg = Number(tx.meta?.amount_htg ?? 0);
-      if (expectedHtg && typeof p.amount === "number" && p.amount + 0.001 < expectedHtg) {
-        console.error("[deposit] amount mismatch", tx.id, p.amount, expectedHtg);
+      if (isUnderpaid(p.amount, expectedHtg)) {
+        // The user paid LESS than requested: never credit the wallet. Keep the transaction failed but flag it so support
+        // can refund / top up the difference by hand (nothing is lost: paid_htg is recorded).
+        console.error("[deposit] UNDERPAID, needs refund:", tx.reference, "paid_htg", p.amount, "expected_htg", expectedHtg);
+        try { await mergeTxMeta(tx, underpaidMeta(p.amount, expectedHtg)); } catch (e) { console.error("[deposit] could not flag underpayment:", (e as Error).message); }
         if (await failTx(tx.id, "Amount mismatch")) {
-          await notify(tx.user_id, "Deposit failed", "The amount received did not match your request.");
+          await notify(tx.user_id, "Deposit not credited",
+            `We received ${Number(p.amount)} HTG instead of the ${expectedHtg} HTG you requested, so your wallet was not credited. Our support team will contact you about the amount we received.`);
         }
         return "failed";
       }
@@ -204,8 +229,68 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
     return "pending";
   }
 
-  if (tx.kind === "card_creation" && tx.card_id) {
+  if (tx.kind === "card_fund" && tx.card_id && tx.meta?.needs_review) {
+    // Ambiguous Freda answer (timeout / 5xx) when the card was funded. Replaying POST /fund with the SAME reference is
+    // safe: Freda answers with the original result (idempotent_replay) and never moves the money twice.
+    if (Date.now() - new Date(tx.created_at).getTime() > REPLAY_WINDOW_MS) {
+      console.error("[card_fund] still needs manual review after 24h:", tx.reference);
+      return "pending";
+    }
     const { data: card } = await db.from("cards").select("*").eq("id", tx.card_id).maybeSingle();
+    if (!card?.freda_card_id) return "pending";
+    const amount = Math.abs(Number(tx.amount));
+    let res: any;
+    try {
+      res = await freda.fundCard(card.freda_card_id, amount, tx.reference);
+    } catch (e) {
+      if (e instanceof FredaError && e.ambiguous) return "pending"; // still unknown: try again next round
+      if (e instanceof FredaError) {
+        console.error("[card_fund] replay rejected:", tx.reference, e.status, e.code);
+        if (await failTx(tx.id, "Provider rejected the funding")) {
+          await notify(tx.user_id, "Card funding failed", "We could not add money to your card. The money is back in your wallet.");
+        }
+        return "failed";
+      }
+      throw e;
+    }
+    if (await completeTx(tx.id)) {
+      const real = readCardDetails(res).balance;
+      await db.from("cards").update({ balance: real ?? round2(Number(card.balance ?? 0) + amount) }).eq("id", card.id);
+      await notify(tx.user_id, "Card funded", `${money(amount)} added to ${card.label}.`);
+    }
+    return "completed";
+  }
+
+  if (tx.kind === "card_creation" && tx.card_id) {
+    let { data: card } = await db.from("cards").select("*").eq("id", tx.card_id).maybeSingle();
+    if (card && !card.freda_card_id && card.status === "pending") {
+      // createCard had an unknown outcome: replaying the same `reference` returns the existing card (never a second one).
+      if (Date.now() - new Date(tx.created_at).getTime() < CARD_REPLAY_MIN_AGE_MS) return "pending";
+      const holderId = await holderFredaIdFor(tx, card);
+      if (!holderId) {
+        console.error("[card_creation] cannot replay, holder unknown:", tx.reference);
+        return "pending";
+      }
+      let res: any;
+      try {
+        res = await freda.createCard({ reference: card.reference, kind: "individual", brand: card.brand, amount: Math.abs(Number(tx.amount)), holder_id: holderId });
+      } catch (e) {
+        if (e instanceof FredaError && e.ambiguous) return "pending";
+        if (e instanceof FredaError) {
+          console.error("[card_creation] replay rejected:", tx.reference, e.status, e.code);
+          await db.from("cards").update({ status: "failed" }).eq("id", card.id);
+          if (await failTx(tx.id, "Provider rejected the card")) {
+            await notify(tx.user_id, "Card creation failed", "We could not create your card. The money is back in your wallet.");
+          }
+          return "failed";
+        }
+        throw e;
+      }
+      if (!res?.id) return "pending";
+      await db.from("cards").update({ freda_card_id: res.id }).eq("id", card.id);
+      card = { ...card, freda_card_id: res.id };
+      if (res?.status && normalizeCardStatus(res.status) !== "pending") card = await applyCardStatus(card, res.status);
+    }
     if (card) await syncCardRow(card);
     const fresh = await getTx(tx.id);
     return fresh?.status ?? "pending";
@@ -245,6 +330,14 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
   }
 
   return "pending";
+}
+
+/** Freda holder id to use when replaying a card creation: stored on the transaction, else the user's latest holder. */
+async function holderFredaIdFor(tx: any, card: any): Promise<string | undefined> {
+  if (typeof tx.meta?.holder_id === "string" && tx.meta.holder_id) return tx.meta.holder_id;
+  const { data } = await db.from("card_holders").select("freda_holder_id").eq("user_id", card.user_id)
+    .not("freda_holder_id", "is", null).order("created_at", { ascending: false }).limit(1);
+  return data?.[0]?.freda_holder_id ?? undefined;
 }
 
 // ------------------------------------------------------------------ cards
@@ -369,11 +462,11 @@ export async function findExistingHolder(email: string, idNumber: string): Promi
   const hit = enrolled[0];
   if (!hit) {
     const bad = newestFirst(mine)[0];
-    console.error("[holder] no enrolled holder on Freda for this user.", bad ? `Latest: status=${bad.status} reason=${bad.failure_reason ?? ""}` : "None listed.");
+    console.error("[holder] no enrolled holder on Freda for this user.", bad ? `Latest: status=${bad.status}` : "None listed.");
     return { found: false };
   }
   const id = pickId(hit);
-  if (!id) console.error("[holder] enrolled holder without id. Entry:", JSON.stringify(hit).slice(0, 400));
+  if (!id) console.error("[holder] enrolled holder without id (status=" + String(hit?.status ?? "") + ")");
   return { found: true, ...(id ? { id } : {}) };
 }
 

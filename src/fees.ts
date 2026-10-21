@@ -22,6 +22,10 @@ export type FeeRule = {
 /** Raised for a fee problem the user can act on (amount outside the brackets, fees not configured). */
 export class FeeError extends Error {}
 
+/** Sanity caps so a typo (or a hijacked admin account) cannot set a ruinous fee. */
+export const MAX_FLAT_FEE_USD = 100;
+export const MAX_PERCENT_FEE = 20;
+
 const usd = (n: number) => `$${Number.isInteger(n) ? n : n.toFixed(2)}`;
 
 export function rowToRule(r: any): FeeRule {
@@ -92,7 +96,9 @@ export function computeFee(rules: FeeRule[], op: FeeOperation, amount: number): 
 /** Checks a rule an admin wants to save against the other rules of the same operation. Returns an error message or null. */
 export function validateRule(rule: Omit<FeeRule, "id" | "label"> & { id?: string }, others: FeeRule[]): string | null {
   const tiered = TIERED_OPERATIONS.includes(rule.operation);
-  if (rule.feeType === "percent" && rule.feeValue > 100) return "A percentage fee cannot be more than 100.";
+  if (!Number.isFinite(rule.feeValue) || rule.feeValue < 0) return "The fee must be a positive number.";
+  if (rule.feeType === "percent" && rule.feeValue > MAX_PERCENT_FEE) return `A percentage fee cannot be more than ${MAX_PERCENT_FEE}%.`;
+  if (rule.feeType === "flat" && rule.feeValue > MAX_FLAT_FEE_USD) return `A flat fee cannot be more than $${MAX_FLAT_FEE_USD}.`;
   if ((rule.minAmount === null) !== (rule.maxAmount === null)) return "Set both the minimum and the maximum amount, or neither.";
   if (tiered && rule.minAmount === null) return "This operation needs an amount bracket (minimum and maximum).";
   if (!tiered && rule.minAmount !== null) return "This operation has a single fee: remove the minimum and maximum amount.";

@@ -5,7 +5,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { supabaseAdmin } from "./supabase.js";
 import * as L from "./ledger.js";
 import { fredaConfigured, fredaMode, verifyWebhookSignature } from "./freda.js";
-import { STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
+import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { bearerToken, createRateLimiter, getHandler, isJsonRequest, makeOriginCheck, noStore, securityHeaders } from "./security.js";
@@ -91,7 +91,7 @@ app.post("/api/webhooks/freda", express.raw({ type: "*/*", limit: "1mb" }), asyn
         else if (card && map[type]) await L.applyCardStatus(card, map[type]!);
       }
     } catch (e) {
-      console.error("[webhook] processing error", type, e);
+      console.error("[webhook] processing error", type, (e as Error)?.message);
       if (eventId) await L.db.from("webhook_events").delete().eq("id", eventId);
     }
   })();
@@ -176,12 +176,14 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
       userId: data.user.id,
       email: data.user.email ?? "",
       token,
+      mfa: req.mfaRequired,
+      aal: req.aal as "aal1" | "aal2",
       ip: req.ip ?? null,
       ua: (req.header("user-agent") ?? "").slice(0, 300) || null,
     };
     return next();
   } catch (e) {
-    console.error("[auth]", e);
+    console.error("[auth]", (e as Error)?.message);
     return res.status(503).json({ error: { message: "Authentication service unavailable." } });
   }
 }
@@ -192,9 +194,7 @@ async function stepUp(req: AuthedRequest, res: Response, next: NextFunction) {
   const rule = Object.prototype.hasOwnProperty.call(STEP_UP, name) ? STEP_UP[name] : undefined;
   if (!rule && !mfaEndpointRequired(name)) return next();
   const ctx = req.ctx!;
-  if (req.mfaRequired && req.aal !== "aal2") {
-    return res.status(403).json({ error: { message: "Enter your 2FA code to continue.", code: "MFA_REQUIRED" } });
-  }
+  if (mfaBlocked(!!req.mfaRequired, req.aal)) return res.status(403).json(MFA_REQUIRED_ERROR);
   if (!rule || !rule.field) return next(); // 2FA-only rule (card details): the card code is verified by the handler
   const pw = req.body?.[rule.field];
   if (typeof pw !== "string" || !pw || pw.length > 200) {
@@ -247,7 +247,7 @@ app.use((_req, res) => res.status(404).json({ error: { message: "Not found." } }
 // Last resort: malformed JSON, oversized bodies, unexpected throws. Never leak stack traces.
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   const status = err?.status === 413 || err?.type === "entity.too.large" ? 413 : err?.type === "entity.parse.failed" ? 400 : 500;
-  if (status === 500) console.error("[unhandled]", err);
+  if (status === 500) console.error("[unhandled]", err?.message);
   res.status(status).json({ error: { message: status === 413 ? "Request too large." : status === 400 ? "Invalid JSON." : "Something went wrong." } });
 });
 
@@ -285,6 +285,23 @@ async function reconcile() {
         }
       } catch (e) {
         console.error("[reconcile]", tx.reference, (e as Error).message);
+      }
+    }
+    // Card fundings whose Freda answer was unknown (meta.needs_review): replay POST /fund with the same reference
+    // (idempotent). Only for rows younger than 24h; older ones stay flagged for manual review and are logged hourly.
+    {
+      const { data: funds } = await L.db.from("transactions").select("*")
+        .eq("status", "pending").eq("kind", "card_fund").eq("meta->>needs_review", "true")
+        .gt("created_at", new Date(Date.now() - L.REPLAY_WINDOW_MS).toISOString())
+        .lt("created_at", new Date(Date.now() - 15_000).toISOString())
+        .order("created_at").limit(10);
+      for (const tx of funds ?? []) {
+        try { await L.settleTransaction(tx); } catch (e) { console.error("[reconcile] card_fund", tx.reference, (e as Error).message); }
+      }
+      if (tick % 120 === 1) {
+        const { data: stale } = await L.db.from("transactions").select("reference").eq("status", "pending").eq("kind", "card_fund")
+          .eq("meta->>needs_review", "true").lt("created_at", new Date(Date.now() - L.REPLAY_WINDOW_MS).toISOString()).limit(50);
+        for (const r of stale ?? []) console.error("[reconcile] card_fund needs manual review (older than 24h):", r.reference);
       }
     }
     // Every ~2 minutes, check live cards: a card closed on the Freda side gets blocked here too.

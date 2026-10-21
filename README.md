@@ -26,7 +26,6 @@ Error: `{ "error": { "message": "..." } }`.
 | --- | --- |
 | `getPublicConfig` | rates, fees, minimums, sandbox flag |
 | `logActivity` | write a security activity entry |
-| `submitKyc` | save identity details (files are uploaded by the app to the private `kyc-documents` bucket) |
 | `startDeposit` / `syncTransaction` | MonCash / NatCash top-up (`/v1/payments`) and status check |
 | `startWithdrawal` | wallet to MonCash / NatCash (`/v1/payouts`), fee from the fee schedule |
 | `searchUsers` / `sendMoney` | Kasho to Kasho transfers by `@username` |
@@ -97,3 +96,12 @@ Run `supabase/migrations/20261009010000_card_code.sql` (or `kasho-pay-card-code.
 ## Deploy on Render
 
 Create a **Web Service**, language **Node**, repo root = this folder (leave Root Directory empty). Build command `npm install`, start command `npm start`. Enter the variables from `.env.example` in Environment (do not set PORT; set NODE_ENV=production). `package.json` must be at the root of the repository.
+
+## Latest hardening (migration `20261021020000_remaining_fixes.sql`, run it after the previous ones)
+- Admin (fees) endpoints need a verified 2FA factor and an aal2 session; fee caps: flat <= $100, percent <= 20.
+- `ENFORCE_MFA_ALL` now defaults to `true`: a user with a verified TOTP factor must pass the 2FA code (aal2) for all money / personal-data endpoints. Refusals are always HTTP 403 `{ error: { code: "MFA_REQUIRED" } }`; the app asks for the code and retries.
+- `getIdentity` needs `confirmPassword` in the request body (password step-up).
+- `sendMoney` accepts an optional `idempotencyKey` (8-64 chars `A-Za-z0-9_-`, one per send). A retry with the same key returns the original `reference` and never sends twice. Needs the migration (`transactions.idempotency_key`, 7-argument `kasho_transfer`).
+- Pending money is now recovered automatically: an ambiguous `card_fund` is replayed (same Freda `reference`) for 24 h, a card creation without a Freda card id is replayed with the same `reference`. Underpaid deposits are not credited, are flagged `meta.underpaid / needs_refund` and logged.
+- `changePassword` signs out all other sessions of the user.
+- Legacy `kyc-documents` storage policies dropped (the backend only uses the private `kyc-docs` bucket).

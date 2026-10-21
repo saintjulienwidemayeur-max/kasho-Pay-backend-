@@ -9,9 +9,11 @@ import { FEE_OPERATIONS, TIERED_OPERATIONS, amountRange, computeFee, rowToRule, 
 import { decryptField, encryptField, hashCardCode, verifyCardCode } from "./crypto.js";
 import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup.js";
 import { cardCodeAttemptAllowed, resetCardCodeAttempts } from "./cardcode.js";
-import { createSession, diditConfigured, getDecision, mapStatus, DiditError } from "./didit.js";
+import { createSession, diditConfigured, getDecision, mapStatus } from "./didit.js";
 
-export type Ctx = { userId: string; email: string; ip: string | null; ua: string | null; token?: string };
+export type Ctx = { userId: string; email: string; ip: string | null; ua: string | null; token?: string;
+  /** The user has a verified TOTP factor. */ mfa?: boolean;
+  /** Assurance level of the access token ("aal2" = 2FA code passed in this session). */ aal?: "aal1" | "aal2" };
 type Handler = { schema: z.ZodTypeAny; run: (d: any, c: Ctx) => Promise<unknown> };
 
 const provider = z.enum(["moncash", "natcash"]);
@@ -70,7 +72,7 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
       // Freda says this identity already exists (created earlier under another e-mail): reuse that enrolled holder.
       id = await L.findEnrolledHolderByName(d.firstName, d.lastName, c.userId);
       if (!id) {
-        console.error("[holder] Freda reports a duplicate identity but no enrolled holder could be matched for", d.email);
+        console.error("[holder] Freda reports a duplicate identity but no enrolled holder could be matched.");
         throw new L.AppError("We could not activate your card profile. Please contact support.");
       }
     }
@@ -108,10 +110,29 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
   };
 }
 
-/** Only users listed in the `admins` table (server-only) may change fees. */
+export const ADMIN_MFA_MESSAGE = "Turn on two-factor authentication to manage fees.";
+
+/** Admin access also needs a verified TOTP factor AND an aal2 session (2FA code passed in this session). */
+export function adminMfaOk(c: Pick<Ctx, "mfa" | "aal">): boolean {
+  return c.mfa === true && c.aal === "aal2";
+}
+
+/** Only users listed in the `admins` table (server-only) may change fees, and only with 2FA. */
 async function requireAdmin(c: Ctx) {
+  if (!adminMfaOk(c)) throw new L.AppError(ADMIN_MFA_MESSAGE);
   const { data } = await L.db.from("admins").select("user_id").eq("user_id", c.userId).maybeSingle();
   if (!data) throw new L.AppError("You do not have access to this.");
+}
+
+/** Text of a Freda error body, only for matching (never logged or shown). */
+const rawText = (raw: unknown) => { try { return JSON.stringify(raw ?? ""); } catch { return ""; } };
+
+/** Client-chosen key that makes a send retry-safe: 8-64 chars, letters, digits, "_" and "-". */
+export const idempotencyKey = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
+
+/** True when a stored transfer_out row is the same transfer (same recipient and amount) as the one being requested. */
+export function sameTransfer(prev: { amount: unknown; counterparty_id: unknown }, toId: string, amount: number): boolean {
+  return prev.counterparty_id === toId && Math.abs(Math.abs(Number(prev.amount)) - amount) < 0.005;
 }
 
 const feeRuleInput = z.object({
@@ -256,6 +277,16 @@ export const handlers: Record<string, Handler> = {
       if (d.newPassword === d.currentPassword) throw new L.AppError("Choose a new password different from the current one.");
       const { error } = await L.db.auth.admin.updateUserById(c.userId, { password: d.newPassword });
       if (error) throw new L.AppError(error.message.includes("weak") ? "That password is too weak." : "Could not update the password.");
+      // Revoke every OTHER session (stolen / forgotten devices); the current one keeps working. Already issued access
+      // tokens of those sessions stay valid until they expire (<= 1 h by default), but they can no longer be refreshed.
+      if (c.token) {
+        try {
+          const { error: outErr } = await L.db.auth.admin.signOut(c.token, "others");
+          if (outErr) console.error("[password] could not revoke other sessions:", outErr.message);
+        } catch (e) {
+          console.error("[password] could not revoke other sessions:", (e as Error).message);
+        }
+      }
       await L.notify(c.userId, "Password changed", "Your password was changed. If this was not you, contact support now.");
       return { ok: true };
     },
@@ -269,7 +300,7 @@ export const handlers: Record<string, Handler> = {
       const { data: p } = await L.db.from("profiles").select("kyc_status").eq("id", c.userId).single();
       if (p?.kyc_status === "verified") throw new L.AppError("Your identity is already verified.");
       const front = (process.env["FRONTEND_URL"] ?? "http://localhost:5173").replace(/\/+$/, "");
-      try {
+      {
         const s = await createSession({ userId: c.userId, callback: `${front}/kyc` });
         // Didit can hand back the same session when the user comes back to continue: reuse its row instead of inserting a duplicate.
         const { data: existing } = await L.db.from("kyc_submissions").select("id, reference, user_id")
@@ -288,9 +319,6 @@ export const handlers: Record<string, Handler> = {
         }
         await L.db.from("profiles").update({ kyc_status: "pending", kyc_reference: reference }).eq("id", c.userId);
         return { url: s.url, reference };
-      } catch (e) {
-        if (e instanceof DiditError) throw new L.AppError(e.message);
-        throw e;
       }
     },
   },
@@ -300,12 +328,8 @@ export const handlers: Record<string, Handler> = {
       const { data: sub } = await L.db.from("kyc_submissions").select("didit_session_id").eq("user_id", c.userId)
         .not("didit_session_id", "is", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
       if (!sub?.didit_session_id) return { status: "unverified" };
-      try {
-        return { status: await L.applyKycDecision(sub.didit_session_id, c.userId) };
-      } catch (e) {
-        if (e instanceof DiditError) throw new L.AppError(e.message);
-        throw e;
-      }
+      // DiditError is mapped to a generic user message by toUserError (details stay in the server log).
+      return { status: await L.applyKycDecision(sub.didit_session_id, c.userId) };
     },
   },
 
@@ -424,12 +448,28 @@ export const handlers: Record<string, Handler> = {
   },
 
   sendMoney: {
-    schema: z.object({ username: z.string().min(2).max(40), amountUsd: z.number().positive().max(5000), note: z.string().max(140).optional() }),
+    schema: z.object({
+      username: z.string().min(2).max(40), amountUsd: z.number().positive().max(5000), note: z.string().max(140).optional(),
+      /** Random key the app generates once per send (8-64 chars). A retry with the same key never sends twice. */
+      idempotencyKey: idempotencyKey.optional(),
+    }),
     run: async (d, c) => {
       const username = d.username.toLowerCase().replace(/^@/, "");
       const { data: target } = await L.db.from("profiles").select("id, display_name, username").eq("username", username).maybeSingle();
       if (!target) throw new L.AppError("We could not find that Kasho user.");
       const amount = round2(d.amountUsd);
+      const recipientName = (target.display_name || `@${target.username}`) as string;
+      // Retry of a transfer that already went through: answer with the original result, move no money, notify nobody.
+      const replay = async () => {
+        if (!d.idempotencyKey) return null;
+        const { data: prev } = await L.db.from("transactions").select("reference, amount, fee, counterparty_id")
+          .eq("user_id", c.userId).eq("idempotency_key", d.idempotencyKey).maybeSingle();
+        if (!prev) return null;
+        if (!sameTransfer(prev, target.id, amount)) throw new L.AppError("This request was already used for a different transfer. Please try again.");
+        return { reference: prev.reference as string, recipient: recipientName, fee: Number(prev.fee ?? 0) };
+      };
+      const earlier = await replay();
+      if (earlier) return earlier;
       const cfg = getConfig();
       // The sender pays the amount plus the fee; the recipient receives the full amount.
       const fee = computeFee(await L.feeRules(), "transfer", amount);
@@ -440,12 +480,20 @@ export const handlers: Record<string, Handler> = {
       const { data: ref, error } = await L.db.rpc("kasho_transfer", {
         p_from: c.userId, p_to: target.id, p_amount: amount, p_note: d.note ?? "", p_fee: fee,
         p_daily_limit: cfg.dailyTransferLimitUsd, // re-checked atomically under the wallet lock
+        p_idempotency_key: d.idempotencyKey ?? null,
       });
-      if (error) throw error;
+      if (error) {
+        // Two parallel requests with the same key: the database accepted only one, answer with its result.
+        if (d.idempotencyKey && String(error.code) === "23505") {
+          const again = await replay();
+          if (again) return again;
+        }
+        throw error;
+      }
       const { data: me } = await L.db.from("profiles").select("display_name, username").eq("id", c.userId).single();
       await L.notify(target.id, "Money received", `${me?.display_name || "@" + me?.username} sent you $${amount.toFixed(2)}`);
       await L.notify(c.userId, "Money sent", `$${amount.toFixed(2)} sent to ${target.display_name || "@" + target.username}${fee > 0 ? ` (fee $${fee.toFixed(2)})` : ""}`);
-      return { reference: ref as string, recipient: (target.display_name || `@${target.username}`) as string, fee };
+      return { reference: ref as string, recipient: recipientName, fee };
     },
   },
 
@@ -516,7 +564,7 @@ export const handlers: Record<string, Handler> = {
             const g: any = await freda.getHolder(holder.freda_holder_id);
             const h = g?.holder ?? g;
             if (!h?.status || String(h.status).toLowerCase() === "enrolled") holderFredaId = holder.freda_holder_id;
-            else console.error("[holder] stored holder", holder.freda_holder_id, "is", h.status, h.failure_reason ?? "");
+            else console.error("[holder] stored holder is not enrolled, status:", h.status);
           } catch (e) {
             console.error("[holder] could not read stored holder:", (e as Error).message);
           }
@@ -550,10 +598,10 @@ export const handlers: Record<string, Handler> = {
               identity,
             });
           } catch (e) {
-            if (e instanceof FredaError) console.error("[holder] identity upgrade rejected", e.status, e.code, e.message, "| raw:", JSON.stringify(e.raw ?? null));
+            if (e instanceof FredaError) console.error("[holder] identity upgrade rejected", e.status, e.code, e.message);
             // Freda's own provider answers "customer is already enrolled" when the holder is upgraded: the holder
             // exists and is usable, so carry on to the card request (a failure there is refunded automatically).
-            if (!(e instanceof FredaError && /already enrolled/i.test(`${e.message} ${JSON.stringify(e.raw ?? "")}`))) throw e;
+            if (!(e instanceof FredaError && /already enrolled/i.test(`${e.message} ${rawText(e.raw)}`))) throw e;
           }
           await L.db.from("card_holders").update({ identity_sent: true }).eq("id", holder.id);
         }
@@ -567,7 +615,7 @@ export const handlers: Record<string, Handler> = {
 
       const txId = await L.debit({
         user: c.userId, kind: "card_creation", title: `New card: ${label}`, category: "Card", method: "Wallet",
-        amount, fee, status: "pending", meta: { label },
+        amount, fee, status: "pending", meta: { label, holder_id: holderFredaId },
       });
       const { error: insErr } = await L.db.from("cards").insert({
         id: cardId, user_id: c.userId, reference, label, color: d.color, brand: d.brand, status: "pending", creation_tx_id: txId,
@@ -585,7 +633,7 @@ export const handlers: Record<string, Handler> = {
         try {
           res = await freda.createCard(cardReq);
         } catch (e) {
-          if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", JSON.stringify(cardReq), "mode:", mode, "->", e.status, e.code, e.message, "| raw:", JSON.stringify(e.raw ?? null));
+          if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);
           throw e;
         }
         await L.db.from("cards").update({ freda_card_id: res.id ?? null }).eq("id", cardId);

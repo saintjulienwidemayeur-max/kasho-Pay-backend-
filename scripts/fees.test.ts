@@ -67,5 +67,9 @@ test("rule validation", () => {
   assert.match(validateRule({ ...base, minAmount: 5, maxAmount: null }, RULES) ?? "", /both/);
   assert.match(validateRule({ operation: "card_fund", feeType: "flat", minAmount: null, maxAmount: null, feeValue: 3, active: true }, RULES) ?? "", /already has an active fee/);
   assert.match(validateRule({ operation: "transfer", feeType: "percent", minAmount: 1, maxAmount: 5, feeValue: 3, active: true, id: "x" }, RULES) ?? "", /single fee/);
-  assert.match(validateRule({ operation: "transfer", feeType: "percent", minAmount: null, maxAmount: null, feeValue: 101, active: true, id: "x" }, RULES) ?? "", /100/);
+  assert.match(validateRule({ operation: "transfer", feeType: "percent", minAmount: null, maxAmount: null, feeValue: 21, active: true, id: "x" }, RULES) ?? "", /20/);
+  assert.equal(validateRule({ operation: "transfer", feeType: "percent", minAmount: null, maxAmount: null, feeValue: 20, active: true, id: "transfer-null" }, RULES), null);
+  assert.match(validateRule({ operation: "card_creation", feeType: "flat", minAmount: null, maxAmount: null, feeValue: 100.01, active: true, id: "card_creation-null" }, RULES) ?? "", /\$100/);
+  assert.equal(validateRule({ operation: "card_creation", feeType: "flat", minAmount: null, maxAmount: null, feeValue: 100, active: true, id: "card_creation-null" }, RULES), null);
+  assert.match(validateRule({ operation: "card_creation", feeType: "flat", minAmount: null, maxAmount: null, feeValue: -1, active: true, id: "card_creation-null" }, RULES) ?? "", /positive/);
 });
