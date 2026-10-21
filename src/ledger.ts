@@ -27,12 +27,20 @@ export function toUserError(e: any): Error {
       case "INVALID_AMOUNT":
         return new AppError(e.message);
       case "HOLDER_PROFILE_REQUIRED":
+      case "HOLDER_PROFILE_INCOMPLETE":
       case "HOLDER_NOT_ENROLLED":
       case "HOLDER_MODE_MISMATCH":
       case "HOLDER_CREATION_FAILED":
         return new AppError("We could not verify your card profile. Please check your profile details (name, phone, address) and try again.");
       case "CARD_FROZEN":
         return new AppError("This card is frozen. Unfreeze it first.");
+      case "CARD_NOT_READY":
+        return new AppError("Your card is not active yet. Please try again in a few seconds.");
+      case "INSUFFICIENT_CARD_BALANCE":
+        return new AppError("That is more than the card balance.");
+      case "AMOUNT_BELOW_FEE":
+      case "AMOUNT_TOO_LOW":
+        return new AppError("That amount is too small. Please try a larger amount.");
       case "RATE_LIMITED":
         return new AppError("Too many requests. Please wait a minute and try again.");
       case "NETWORK":
@@ -48,6 +56,9 @@ export function toUserError(e: any): Error {
       case "ISSUING_LIVE_NOT_ENABLED":
       case "INSUFFICIENT_BALANCE":
       case "BELOW_MINIMUM_BALANCE":
+      case "CARD_LIMIT_REACHED":
+      case "ACCOUNT_SUSPENDED":
+      case "MERCHANT_NOT_FOUND":
       case "CARD_PROVIDER_AUTH":
       case "CARD_LIVE_NOT_CONFIGURED":
       case "HOLDER_MODE_MISMATCH":

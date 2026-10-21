@@ -71,7 +71,7 @@ app.post("/api/webhooks/freda", express.raw({ type: "*/*", limit: "1mb" }), asyn
   res.status(200).send("ok");
   void (async () => {
     try {
-      if (type === "payment.succeeded" || type === "payout.succeeded" || type === "payout.failed") {
+      if (type === "payment.succeeded" || type === "payment.failed" || type === "payout.succeeded" || type === "payout.failed") {
         let { data: tx } = await L.db.from("transactions").select("*").eq("provider_ref", d.id ?? "").maybeSingle();
         if (!tx && d.reference) ({ data: tx } = await L.db.from("transactions").select("*").eq("reference", d.reference).maybeSingle());
         if (tx) {

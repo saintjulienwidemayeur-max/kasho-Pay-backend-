@@ -623,10 +623,11 @@ export const handlers: Record<string, Handler> = {
         method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee, card: card.id,
       });
       try {
-        await freda.fundCard(card.freda_card_id, amount);
+        // The ledger reference is the idempotency key, so a retry of the same request can never fund the card twice.
+        await freda.fundCard(card.freda_card_id, amount, (await L.getTx(txId)).reference);
       } catch (e) {
         if (e instanceof FredaError && e.ambiguous) {
-          // fund has no idempotency key: never auto-refund an unknown outcome
+          // unknown outcome: never auto-refund
           await L.mergeTxMeta(await L.getTx(txId), { needs_review: true });
         } else {
           await L.failTx(txId, "Provider rejected the funding");
@@ -660,7 +661,7 @@ export const handlers: Record<string, Handler> = {
         meta: { freda_balance_before: before },
       });
       try {
-        await freda.withdrawCard(card.freda_card_id, amount);
+        await freda.withdrawCard(card.freda_card_id, amount, tx.reference);
       } catch (e) {
         // Ambiguous (timeout/5xx): leave it pending, the reconcile loop compares balances and settles it.
         if (!(e instanceof FredaError && e.ambiguous)) await L.failTx(tx.id, "Provider rejected the withdrawal");
