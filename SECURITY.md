@@ -63,3 +63,12 @@ Run the unit tests: `npm test`. Run the live probes against a running server: `n
 ## Card code (4 digits)
 
 Card details (number, CVV, expiry) are revealed only after the customer creates a 4-digit code (`setCardCode`, requires password and 2FA if enabled). The code is stored hashed (scrypt + HMAC pepper) in `card_codes`, which the browser cannot read. Revealing requires the code (`revealCardFn`) and, when 2FA is on, an aal2 session. 5 wrong codes lock reveal for 15 minutes. Trivial codes (1111, 1234, ...) are refused.
+
+## Web Push notifications (migration `20261025000000_push_subscriptions.sql`)
+- Setup: run `npm run vapid:generate`, put `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (`mailto:` or https URL) in the environment (Render: dashboard, `sync: false`), run the migration. Without the keys push is silently disabled (one startup warning).
+- Endpoints: `savePushSubscription`, `removePushSubscription`, `sendTestPush` (3/min); `getPublicConfig` returns `pushPublicKey` (or null).
+- What is sent: every in-app transaction notification (same title/body as the notifications table, in French or English depending on the device language) and one "Bonjour" greeting per device per local day between 08:00 and 10:59 (device time zone, default America/Port-au-Prince).
+- The morning greeting contains the first name only: never a balance or an amount (lock screens are visible to others). Transaction pushes do contain the amount, like the in-app notification; users can turn push off with `notification_prefs.push = false`.
+- Who can receive: only the authenticated owner of a subscription; one endpoint belongs to one user (re-registering from another account moves it); max 10 devices per user.
+- Safety: the table is server-only (RLS on, no policies). Endpoints must be https on a known push service (FCM, Mozilla, Apple, Windows) so the server cannot be used to call arbitrary URLs; keys are length-checked; endpoints, keys and message bodies are never logged. Dead subscriptions (404/410) are deleted, others after 5 consecutive failures. The greeting is claimed in the database before sending, so a restart or several instances never greet twice.
+- Rotating VAPID keys: generate a new pair, update the three variables, redeploy. Old subscriptions stop working and are removed on their next failed send; users must re-enable notifications.
