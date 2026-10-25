@@ -8,6 +8,7 @@ import { fredaConfigured, fredaMode, verifyWebhookSignature } from "./freda.js";
 import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
+import { initPush, runMorningGreetings } from "./push.js";
 import { bearerToken, createRateLimiter, getHandler, isJsonRequest, makeOriginCheck, noStore, securityHeaders } from "./security.js";
 
 const production = process.env["NODE_ENV"] === "production";
@@ -151,6 +152,9 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   fileDisputeFn: { windowMs: HOUR, max: 20 },
   sendSupportMessage: { windowMs: HOUR, max: 5 },
   logActivity: { windowMs: MIN, max: 20 },
+  savePushSubscription: { windowMs: MIN, max: 10 },
+  removePushSubscription: { windowMs: MIN, max: 10 },
+  sendTestPush: { windowMs: MIN, max: 3 },
   adminSaveFee: { windowMs: MIN, max: 20 },
   adminDeleteFee: { windowMs: MIN, max: 20 },
 };
@@ -339,4 +343,12 @@ app.listen(port, () => {
     for (const i of list ?? []) if (i.family === "IPv4" && !i.internal) console.log(`  On your network: http://${i.address}:${port}/health`);
   }
   setInterval(reconcile, 30_000);
+  const push = initPush();
+  if (push.configured) {
+    console.log("  Web Push     : configured (morning greeting + transaction notifications)");
+    setInterval(() => { void runMorningGreetings(); }, 5 * 60_000); // overlap-guarded inside
+    void runMorningGreetings();
+  } else {
+    console.warn(`  WARNING: Web Push disabled (${push.reason}). Run \`npm run vapid:generate\`.`);
+  }
 });

@@ -6,6 +6,7 @@ import { round2 } from "./config.js";
 import { FeeError, loadFeeRules, type FeeRule } from "./fees.js";
 import { isSafeRemoteUrl } from "./security.js";
 import { DiditError } from "./didit.js";
+import { sendPushToUser } from "./push.js";
 
 // supabaseAdmin is intentionally loosely typed here (rpc results, jsonb meta).
 export const db: any = supabaseAdmin;
@@ -101,6 +102,7 @@ export async function guard<T>(fn: () => Promise<T>): Promise<T> {
 export async function notify(userId: string, title: string, body: string) {
   const { error } = await db.from("notifications").insert({ user_id: userId, title, body });
   if (error) console.error("[notify]", error.message);
+  void sendPushToUser(userId, { title, body, url: "/", tag: "tx" }); // never throws, never blocks
 }
 
 async function rpc<T = any>(name: string, args: Record<string, unknown>): Promise<T> {

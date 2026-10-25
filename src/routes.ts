@@ -9,6 +9,7 @@ import { FEE_OPERATIONS, TIERED_OPERATIONS, amountRange, computeFee, rowToRule, 
 import { decryptField, encryptField, hashCardCode, verifyCardCode } from "./crypto.js";
 import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup.js";
 import { cardCodeAttemptAllowed, resetCardCodeAttempts } from "./cardcode.js";
+import { MAX_SUBSCRIPTIONS_PER_USER, isAllowedPushEndpoint, pushConfigured, pushPublicKey, sendTestPush, validPushKeys, validTimeZone } from "./push.js";
 import { createSession, diditConfigured, getDecision, mapStatus } from "./didit.js";
 
 export type Ctx = { userId: string; email: string; ip: string | null; ua: string | null; token?: string;
@@ -168,8 +169,47 @@ export const handlers: Record<string, Handler> = {
         minCardPrefundUsd: c.minCardPrefundUsd,
         requireKycForCards: c.requireKycForCards,
         sandbox: fredaConfigured() ? fredaMode() === "sandbox" : true,
+        pushPublicKey: pushPublicKey(),
       };
     },
+  },
+
+  // ---------------------------------------------------------------- web push
+  savePushSubscription: {
+    schema: z.object({
+      endpoint: z.string().max(2048).refine(isAllowedPushEndpoint, "Unsupported push service."),
+      keys: z.object({ p256dh: z.string().max(256), auth: z.string().max(256) }).strict()
+        .refine((k) => validPushKeys(k.p256dh, k.auth), "Invalid push keys."),
+      lang: z.enum(["fr", "en"]),
+      tz: z.string().max(64).refine(validTimeZone, "Invalid time zone.").optional(),
+    }).strict(),
+    run: async (d, c) => {
+      if (!pushConfigured()) return { ok: true };
+      // Upsert by endpoint: an endpoint that belonged to someone else (shared device) moves to the caller.
+      const { error } = await L.db.from("push_subscriptions").upsert({
+        user_id: c.userId, endpoint: d.endpoint, p256dh: d.keys.p256dh, auth: d.keys.auth, lang: d.lang,
+        ...(d.tz ? { tz: d.tz } : {}), user_agent: c.ua, failures: 0,
+      }, { onConflict: "endpoint" });
+      if (error) throw error;
+      // At most 10 devices per user: drop the oldest.
+      const { data: all } = await L.db.from("push_subscriptions").select("id").eq("user_id", c.userId).order("created_at", { ascending: false });
+      const extra = ((all ?? []) as { id: string }[]).slice(MAX_SUBSCRIPTIONS_PER_USER).map((r) => r.id);
+      if (extra.length) await L.db.from("push_subscriptions").delete().in("id", extra);
+      return { ok: true };
+    },
+  },
+
+  removePushSubscription: {
+    schema: z.object({ endpoint: z.string().max(2048) }).strict(),
+    run: async (d, c) => {
+      await L.db.from("push_subscriptions").delete().eq("user_id", c.userId).eq("endpoint", d.endpoint);
+      return { ok: true };
+    },
+  },
+
+  sendTestPush: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => ({ sent: await sendTestPush(c.userId) }),
   },
 
   // ---------------------------------------------------------------- admin: fee schedule
