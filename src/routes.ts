@@ -299,6 +299,8 @@ export const handlers: Record<string, Handler> = {
     schema: z.object({ currentPassword: z.string().min(1).max(200), newEmail: z.string().trim().toLowerCase().email().max(120) }),
     run: async (d, c) => {
       if (d.newEmail === c.email.toLowerCase()) throw new L.AppError("That is already your email address.");
+      const { data: prof } = await L.db.from("profiles").select("kyc_status").eq("id", c.userId).maybeSingle();
+      if (prof?.kyc_status === "verified") throw new L.AppError("Your personal information is locked because your identity is verified. Contact support to change it.");
       const { createClient } = await import("@supabase/supabase-js");
       const user = createClient(process.env["SUPABASE_URL"] ?? "", process.env["SUPABASE_ANON_KEY"] ?? "", {
         auth: { persistSession: false, autoRefreshToken: false },
