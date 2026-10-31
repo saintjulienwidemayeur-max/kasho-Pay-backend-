@@ -832,6 +832,17 @@ export async function refreshKycFromDidit(userId: string): Promise<void> {
   }
 }
 
+/** Every customer whose KYC is "pending" ("En attente") is looked up at Didit, whose webhook may never come. Newest first, at most 20 per round. */
+export async function settlePendingKyc() {
+  const { data: subs, error } = await db.from("kyc_submissions").select("user_id, didit_session_id").eq("status", "pending")
+    .not("didit_session_id", "is", null).gt("created_at", new Date(Date.now() - 7 * 24 * 3600_000).toISOString())
+    .order("created_at", { ascending: false }).limit(20);
+  if (error) { console.error("[kyc] could not list the pending verifications:", error.message); return; }
+  for (const s of subs ?? []) {
+    try { await applyKycDecision(s.didit_session_id, s.user_id); } catch (e) { console.error("[kyc] pending verification", String(s.user_id).slice(0, 8), (e as Error).message); }
+  }
+}
+
 /** Reads the Didit decision for a session and applies it to the user's profile. Returns the Kasho status. */
 export async function applyKycDecision(sessionId: string, userId: string): Promise<string> {
   const dec = await getDecision(sessionId);

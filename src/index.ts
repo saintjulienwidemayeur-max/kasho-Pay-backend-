@@ -301,6 +301,7 @@ async function reconcile() {
     }
     // New cards still "pending": asked about every round (newest first), whatever else is waiting.
     await L.settlePendingCards(tick);
+    if (tick % 2 === 0 && diditConfigured()) await L.settlePendingKyc(); // asks Didit about every pending identity verification, about once a minute
     // Card fundings whose Freda answer was unknown (meta.needs_review): replay POST /fund with the same reference
     // (idempotent). Only for rows younger than 24h; older ones stay flagged for manual review and are logged hourly.
     {
