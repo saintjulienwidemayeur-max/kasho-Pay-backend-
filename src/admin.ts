@@ -5,7 +5,7 @@
 // and a profit figure will only be shown once the rules for it are agreed.
 import { z } from "zod";
 import * as L from "./ledger.js";
-import { freda, fredaConfigured, fredaMode, readFredaBalances, readMasterWallet, type MasterWallet } from "./freda.js";
+import { describeFredaError, freda, fredaConfigured, fredaMode, readFredaBalances, readMasterWallet, type MasterWallet } from "./freda.js";
 import { getConfig, round2 } from "./config.js";
 import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import type { Ctx, Handler } from "./types.js";
@@ -69,6 +69,19 @@ export const resetFredaSnapshotCache = () => { snapshotCache = null; };
 
 const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
   Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+
+/** What Freda says about one card right now (read only), or why it could not be read. Never a card number. */
+export type LiveCard = { status: string; failureReason: string | null } | { error: { code: string; status: number; message: string } };
+async function liveCard(fredaCardId: string): Promise<LiveCard> {
+  try {
+    const g: any = await withTimeout(freda.getCard(fredaCardId), 10_000);
+    const c = g?.card ?? g ?? {};
+    return { status: String(c.status ?? "").slice(0, 40), failureReason: typeof c.failure_reason === "string" && c.failure_reason.trim() ? c.failure_reason.trim().slice(0, 300) : null };
+  } catch (e) {
+    const x = describeFredaError(e);
+    return { error: { code: x.code, status: x.status, message: x.message } };
+  }
+}
 
 export async function fredaSnapshot(): Promise<FredaSnapshot> {
   if (!fredaConfigured()) return { configured: false, mode: null, ok: false, message: "Freda is not configured (FREDA_API_KEY).", fetchedAt: new Date().toISOString(), master: null, gateway: null };
@@ -406,14 +419,18 @@ export const adminHandlers: Record<string, Handler> = {
     schema: z.object({ cardId: uuid }),
     run: async (d, c) => {
       await requireAdmin(c);
-      const card = await q<any>(L.db.from("cards").select("id, user_id, freda_card_id, reference, label, brand, color, status, last4, expiry, balance, hidden, created_at, updated_at").eq("id", d.cardId).maybeSingle());
+      const card = await q<any>(L.db.from("cards").select("id, user_id, freda_card_id, creation_tx_id, reference, label, brand, color, status, last4, expiry, balance, hidden, created_at, updated_at").eq("id", d.cardId).maybeSingle());
       if (!card) throw new L.AppError("Card not found.");
-      const [profile, txs, events, au] = await Promise.all([
+      const [profile, txs, events, au, creationTx, live] = await Promise.all([
         q<any>(L.db.from("profiles").select("display_name, username, kasho_id, kyc_status").eq("id", card.user_id).maybeSingle()),
         q<any[]>(L.db.from("transactions").select("id, reference, kind, title, amount, fee, status, created_at, meta").eq("card_id", d.cardId).order("created_at", { ascending: false }).limit(50)),
         q<any[]>(L.db.from("card_events").select("id, type, amount, created_at").eq("card_id", d.cardId).order("created_at", { ascending: false }).limit(50)),
         L.db.auth.admin.getUserById(card.user_id),
+        card.creation_tx_id ? q<any>(L.db.from("transactions").select("status, meta, created_at").eq("id", card.creation_tx_id).maybeSingle()) : Promise.resolve(null),
+        // A card still "pending": ask Freda what it says right now, so the panel shows the real reason it does not move.
+        card.status === "pending" && card.freda_card_id && fredaConfigured() ? liveCard(card.freda_card_id as string) : Promise.resolve(null),
       ]);
+      const pb = creationTx?.meta?.card_problem;
       return {
         id: card.id as string, label: String(card.label ?? ""), brand: String(card.brand ?? ""), color: String(card.color ?? ""), status: String(card.status ?? ""),
         last4: String(card.last4 ?? ""), expiry: String(card.expiry ?? ""), balance: Number(card.balance ?? 0), hidden: !!card.hidden,
@@ -427,6 +444,15 @@ export const adminHandlers: Record<string, Handler> = {
           status: String(t.status ?? ""), createdAt: t.created_at as string, note: typeof t.meta?.note === "string" ? (t.meta.note as string) : null,
         })),
         purchases: (events ?? []).map((e) => ({ id: String(e.id), type: String(e.type ?? ""), amount: Number(e.amount ?? 0), createdAt: e.created_at as string })),
+        // How the creation went: what we last asked Freda and what it answered. For a card that stays "in creation".
+        creation: creationTx ? {
+          status: String(creationTx.status ?? ""), needsReview: creationTx.meta?.needs_review === true,
+          freda: typeof creationTx.meta?.card_freda_status === "string" ? (creationTx.meta.card_freda_status as string) : null,
+          checkedAt: typeof creationTx.meta?.card_checked_at === "string" ? (creationTx.meta.card_checked_at as string) : null,
+          problem: pb && typeof pb === "object" ? { code: String(pb.code ?? ""), status: Number(pb.status ?? 0), message: String(pb.message ?? ""), at: String(pb.at ?? "") } : null,
+          failureReason: typeof creationTx.meta?.card_failure_reason === "string" ? (creationTx.meta.card_failure_reason as string) : null,
+        } : null,
+        live,
       };
     },
   },

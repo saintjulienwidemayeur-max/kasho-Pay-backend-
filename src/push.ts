@@ -90,6 +90,15 @@ export const PUSH_RULES: Rule[] = [
   { title: "Card creation failed", fr: "Création de carte échouée", bodies: [exact("We could not create your card. The money is back in your wallet.",
     "Nous n'avons pas pu créer votre carte. L'argent est de retour dans votre portefeuille.")] },
   { title: "Card withdrawal completed", fr: "Retrait de carte effectué", bodies: [[new RegExp(`^${AMT} returned to your wallet\\.$`), (m) => `${m[1]} remis dans votre portefeuille.`]] },
+  { title: "Identity verification needed", fr: "Vérification d'identité requise", bodies: [
+    exact("The card service must verify your identity before it can issue your card. Open Cards to continue. Your money is back in your wallet.",
+      "Le service de cartes doit vérifier votre identité avant de pouvoir émettre votre carte. Ouvrez Cartes pour continuer. Votre argent est de retour dans votre portefeuille."),
+    exact("The card service could not verify your identity, so your card was not issued. Please contact support. Your money is back in your wallet.",
+      "Le service de cartes n'a pas pu vérifier votre identité : votre carte n'a donc pas été émise. Contactez le support. Votre argent est de retour dans votre portefeuille."),
+    exact("The card service must verify your identity before it can issue your card. Open Cards to continue.",
+      "Le service de cartes doit vérifier votre identité avant de pouvoir émettre votre carte. Ouvrez Cartes pour continuer.")] },
+  { title: "Your card is taking longer than usual", fr: "Votre carte prend plus de temps que prévu", bodies: [exact("We are still creating your card. Your money is safe: if the card cannot be created, it goes back to your wallet.",
+    "Nous créons toujours votre carte. Votre argent est en sécurité : si la carte ne peut pas être créée, il retourne dans votre portefeuille.")] },
   { title: "Card ready", fr: "Carte prête", bodies: [[/^(.+) is active and ready to use\.$/, (m) => `${m[1]} est active et prête à l'emploi.`]] },
   { title: "Card closed", fr: "Carte fermée", bodies: [
     [/^(.+) was closed and can no longer be used\.$/, (m) => `${m[1]} a été fermée et ne peut plus être utilisée.`],

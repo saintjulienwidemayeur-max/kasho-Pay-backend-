@@ -270,6 +270,7 @@ process.on("uncaughtException", (e) => {
 
 // ---------------------------------------------------------------- reconciliation loop
 // Settles pending deposits / withdrawals / card creations even without webhooks.
+// Card creations have their own pass (L.settlePendingCards): they must never wait behind older deposits.
 const DAY = 24 * 3600 * 1000;
 let reconciling = false;
 let tick = 0;
@@ -279,7 +280,7 @@ async function reconcile() {
   tick += 1;
   try {
     const { data: rows } = await L.db.from("transactions").select("*")
-      .eq("status", "pending").in("kind", ["deposit", "withdrawal", "card_creation", "card_withdraw"])
+      .eq("status", "pending").in("kind", ["deposit", "withdrawal", "card_withdraw"])
       .gt("created_at", new Date(Date.now() - 3 * DAY).toISOString())
       .lt("created_at", new Date(Date.now() - 15_000).toISOString())
       .order("created_at").limit(25);
@@ -298,6 +299,8 @@ async function reconcile() {
         console.error("[reconcile]", tx.reference, (e as Error).message);
       }
     }
+    // New cards still "pending": asked about every round (newest first), whatever else is waiting.
+    await L.settlePendingCards(tick);
     // Card fundings whose Freda answer was unknown (meta.needs_review): replay POST /fund with the same reference
     // (idempotent). Only for rows younger than 24h; older ones stay flagged for manual review and are logged hourly.
     {
