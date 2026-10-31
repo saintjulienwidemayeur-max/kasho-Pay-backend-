@@ -572,8 +572,7 @@ export const handlers: Record<string, Handler> = {
             const h = g?.holder ?? g;
             const hs = String(h?.status ?? "").toLowerCase();
             console.log("[holder] GET stored holder", holder.freda_holder_id, "status:", hs || "?", "failure_reason:", String(h?.failure_reason ?? "-").slice(0, 200));
-            if (!hs || hs === "enrolled") holderFredaId = holder.freda_holder_id;
-            else if (hs === "pending") holderPending = true;
+            if (!hs || hs === "enrolled" || hs === "pending") holderFredaId = holder.freda_holder_id; // the stored id is what the card request needs
             else console.error("[holder] stored holder is not enrolled, status:", h.status, "reason:", String(h?.failure_reason ?? "").slice(0, 200));
           } catch (e) {
             console.error("[holder] could not read stored holder:", (e as Error).message);
@@ -633,23 +632,7 @@ export const handlers: Record<string, Handler> = {
         try {
           res = await freda.createCard(cardReq);
         } catch (first) {
-          // "Le titulaire doit d'abord compléter sa vérification d'identité": the stored holder was created at Freda without a verified
-          // identity (and Freda returns that same holder again for the same e-mail). Create a NEW holder WITH the ID document (the
-          // e-mail gets a +tag so Freda does not hand back the old one), then ask for the card again with a new reference.
-          if (!(first instanceof FredaError && mentionsIdentityVerification(first.message))) throw first;
-          console.error("[card] the holder is not verified at Freda, creating a new holder with the ID document:", holderFredaId);
-          const again = holderInput.safeParse({
-            firstName: holder.first_name, lastName: holder.last_name, email: String(holder.email).replace(/(\+[^@]*)?@/, `+k${Date.now().toString(36)}@`),
-            dob: String(holder.dob).slice(0, 10), country: holder.country, idNumber: decryptField(holder.id_number), phoneCode: holder.phone_code,
-            phone: holder.phone_number, street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code,
-          });
-          if (!again.success) throw first;
-          const r = await registerHolder(again.data, c);
-          if (!r.fredaId || r.status === "pending") throw first;
-          reference = `${reference}_h2`;
-          await L.db.from("cards").update({ reference }).eq("id", cardId);
-          await L.mergeTxMeta(await L.getTx(txId), { holder_id: r.fredaId });
-          res = await freda.createCard({ ...cardReq, reference, holder_id: r.fredaId });
+          throw first;
         }
       } catch (e) {
         if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);

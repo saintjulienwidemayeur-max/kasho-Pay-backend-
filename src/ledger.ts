@@ -717,12 +717,14 @@ export async function findExistingHolder(email: string, idNumber: string): Promi
   const mine = all.filter((h) => norm(h?.email) === norm(email) ||
     (idNumber && norm(h?.identificationNumber ?? h?.identification_number ?? h?.id_number) === norm(idNumber)));
   const enrolled = newestFirst(mine.filter((h) => !h?.status || norm(h.status) === "enrolled"));
-  const hit = enrolled[0];
+  // The holder already exists at Freda: take its id (the newest one of this user), whatever its status says. Creating another one
+  // is refused ("already exists"), and the id is what the card request needs.
+  const hit = enrolled[0] ?? newestFirst(mine)[0];
   if (!hit) {
-    const bad = newestFirst(mine)[0];
-    console.error("[holder] no enrolled holder on Freda for this user.", bad ? `Latest: status=${bad.status}` : "None listed.");
+    console.error("[holder] no holder on Freda for this user.");
     return { found: false };
   }
+  if (!enrolled[0]) console.error("[holder] using the existing holder although its status is", String(hit.status ?? "?"), String(hit.failure_reason ?? "").slice(0, 120));
   const id = pickId(hit);
   if (!id) console.error("[holder] enrolled holder without id (status=" + String(hit?.status ?? "") + ")");
   return { found: true, ...(id ? { id } : {}) };
