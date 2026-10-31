@@ -141,6 +141,7 @@ async function resendHolder(holder: any, holderFredaId: string, c: Ctx): Promise
     identificationNumber: decryptField(holder.id_number), phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
     address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
     identity,
+    restart_verification: true, // Freda: starts a NEW verification at the card provider, same holder id
   }).catch((e: unknown) => console.error("[holder] re-sending the holder failed:", (e as Error).message));
   console.log("[holder] holder sent again with the ID document:", holderFredaId);
   return true;
@@ -682,7 +683,14 @@ export const handlers: Record<string, Handler> = {
           // legible ID restarts the verification; after a minute the card is asked for once more.
           if (!(first instanceof FredaError && (first.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(first.message)))) throw first;
           if (!(await resendHolder(holder, holderFredaId, c))) throw first;
-          await new Promise((r) => setTimeout(r, 60_000));
+          // The new verification can take a few minutes: wait until GET /v1/cards/holders/:id says ready_for_cards (at most ~4 minutes).
+          for (let i = 0; i < 16; i++) {
+            await new Promise((r) => setTimeout(r, 15_000));
+            const g: any = await freda.getHolder(holderFredaId).catch(() => null);
+            const v = (g?.holder ?? g)?.verification;
+            console.log("[holder] waiting for the verification:", JSON.stringify(v ?? null).slice(0, 160));
+            if (v?.ready_for_cards === true || (v === undefined && i >= 3)) break;
+          }
           res = await freda.createCard(cardReq);
         }
       } catch (e) {
