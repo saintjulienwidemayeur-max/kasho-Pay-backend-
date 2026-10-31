@@ -52,12 +52,15 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
 
   // Freda requires an official ID document (type, number, https image) for every holder; it comes from the Didit KYC.
   const identity = await L.getFredaIdentity(c.userId);
+  // Freda requires `identity` (ID type, number, image) to create a holder: without it the holder is never verified and every card asked
+  // for it waits for ever ("Le titulaire doit d'abord compléter sa vérification d'identité"). Stop here, before anything is created or charged.
+  if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
   let id: string | undefined;
   let already = false;
   let holderStatus = "enrolled"; // what Freda says about the holder: pending means it has not finished verifying the identity yet
   try {
     const res: any = await freda.createHolder({
-      ...(identity ? { identity } : {}),
+      identity,
       firstName: d.firstName, lastName: d.lastName, email: d.email, country: d.country, dob: d.dob,
       identificationNumber: d.idNumber, phoneShortCode: d.phoneCode, phoneNumber: d.phone.replace(/\D/g, ""),
       address: { street: d.street, city: d.city, state: d.state, postalCode: d.postalCode, country: d.country },
