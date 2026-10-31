@@ -11,7 +11,7 @@ const F = await import("../src/finance.js");
 const A: any = await import("../src/admin.js");
 const { freda } = await import("../src/freda.js");
 const { rowToRule } = await import("../src/fees.js");
-const { isSuspended } = await import("../src/security.js");
+const { isSuspended, makeAdminSiteGuard } = await import("../src/security.js");
 const { MFA_ENDPOINTS, STEP_UP } = await import("../src/stepup.js");
 const { handlers } = await import("../src/routes.js");
 
@@ -253,6 +253,29 @@ test("every admin endpoint asks for 2FA, and the money ones for the password aga
     assert.deepEqual(STEP_UP[n], { field: "confirmPassword", strip: true }, n);
   }
   for (const n of names) assert.ok((handlers as any)[n], `${n} is served by the API`);
+});
+
+test("the admin tools only answer to the admin site, and the admin site only reaches them", () => {
+  const ADMIN = "https://admin.kashopay.com", APP = "https://app.kashopay.com";
+  const guard = makeAdminSiteGuard([ADMIN], true);
+  for (const n of Object.keys(A.adminHandlers)) {
+    assert.equal(guard(n, ADMIN), null, `${n} from the admin site`);
+    assert.match(guard(n, APP)!, /only work on the Kasho Pay admin site/, `${n} from the customer app`);
+    assert.match(guard(n, undefined)!, /only work on the Kasho Pay admin site/, `${n} without an Origin (a script)`);
+    assert.match(guard(n, "https://admin.kashopay.com.evil.example")!, /admin site/, `${n} from a look-alike origin`);
+  }
+  assert.equal(guard("changePassword", ADMIN), null, "the administrator changes his password on the admin site");
+  for (const n of ["sendMoney", "getIdentity", "revealCardFn", "startWithdrawal", "getPublicConfig"]) assert.match(guard(n, ADMIN)!, /not available from the admin site/, n);
+  for (const n of ["sendMoney", "getPublicConfig", "changePassword"]) { assert.equal(guard(n, APP), null, n); assert.equal(guard(n, undefined), null, n); }
+  // every endpoint whose name starts with "admin" is an admin tool (the guard keys on the name), and the other way round
+  assert.deepEqual(Object.keys(handlers).filter((n) => n.startsWith("admin")).sort(), Object.keys(A.adminHandlers).sort());
+  // not set up: production fails closed (clear message), development is open
+  assert.match(makeAdminSiteGuard([], true)("adminStatus", ADMIN)!, /ADMIN_ORIGINS/);
+  assert.equal(makeAdminSiteGuard([], false)("adminStatus", "http://localhost:5174"), null);
+  assert.equal(makeAdminSiteGuard([], true)("sendMoney", APP), null, "customer endpoints are not affected");
+  // several admin origins
+  const two = makeAdminSiteGuard([ADMIN, "https://admin2.kashopay.com"], true);
+  assert.equal(two("adminOverview", "https://admin2.kashopay.com"), null);
 });
 
 test("a suspended customer is recognised until the ban ends", () => {

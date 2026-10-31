@@ -33,6 +33,9 @@ services:
         sync: false
       - key: CORS_ORIGIN
         sync: false
+      # Origin of the admin site (kasho-pay-admin), e.g. https://admin.kashopay.com. Empty = the admin tools are off.
+      - key: ADMIN_ORIGINS
+        sync: false
       - key: FRONTEND_URL
         sync: false
       - key: VAPID_PUBLIC_KEY
