@@ -524,6 +524,7 @@ export const handlers: Record<string, Handler> = {
     }),
     run: async (d, c) => {
       const cfg = getConfig();
+      await L.refreshKycFromDidit(c.userId); // Didit's webhook may never come: ask for the decision now
       const profile = await loadProfile(c.userId);
       if (cfg.requireKycForCards && profile?.kyc_status !== "verified") {
         throw new L.AppError("Verify your identity before creating a card.");

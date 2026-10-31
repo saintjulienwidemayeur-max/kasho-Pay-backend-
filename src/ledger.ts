@@ -816,6 +816,22 @@ export function mapCardTransaction(t: any, i: number) {
 import { getDecision, mapStatus } from "./didit.js";
 import { decryptField, encryptField } from "./crypto.js";
 
+/**
+ * Didit does not always send its webhook, so the decision is asked for whenever it matters: if this user is not verified here yet but has a
+ * Didit session, read the decision now (the same step as syncKyc). Never throws: a Didit problem must not break the request it helps.
+ */
+export async function refreshKycFromDidit(userId: string): Promise<void> {
+  try {
+    const { data: prof } = await db.from("profiles").select("kyc_status").eq("id", userId).single();
+    if (prof?.kyc_status === "verified") return;
+    const { data: sub } = await db.from("kyc_submissions").select("didit_session_id").eq("user_id", userId)
+      .not("didit_session_id", "is", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
+    if (sub?.didit_session_id) await applyKycDecision(sub.didit_session_id, userId);
+  } catch (e) {
+    console.error("[kyc] could not read the Didit decision:", (e as Error).message);
+  }
+}
+
 /** Reads the Didit decision for a session and applies it to the user's profile. Returns the Kasho status. */
 export async function applyKycDecision(sessionId: string, userId: string): Promise<string> {
   const dec = await getDecision(sessionId);
