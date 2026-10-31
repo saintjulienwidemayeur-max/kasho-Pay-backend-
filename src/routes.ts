@@ -126,6 +126,26 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
 
 
 const lastReverify = new Map<string, number>();
+/** Sends the holder again (same e-mail) with fresh, whole ID photos: this restarts the identity verification at the card provider. At most once per 10 minutes. */
+async function resendHolder(holder: any, holderFredaId: string, c: Ctx): Promise<boolean> {
+  const last = lastReverify.get(holderFredaId) ?? 0;
+  if (Date.now() - last <= 10 * 60_000) return false;
+  lastReverify.set(holderFredaId, Date.now());
+  // Read the ID photos again from Didit (the whole front and back, not a crop) instead of the copies kept earlier.
+  await L.db.from("profiles").update({ kyc_doc_path: null, kyc_doc_back_path: null }).eq("id", c.userId);
+  await L.refreshKycFromDidit(c.userId);
+  const identity = await L.getFredaIdentity(c.userId);
+  if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
+  await freda.createHolder({
+    firstName: holder.first_name, lastName: holder.last_name, email: holder.email, country: holder.country, dob: String(holder.dob).slice(0, 10),
+    identificationNumber: decryptField(holder.id_number), phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
+    address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
+    identity,
+  }).catch((e: unknown) => console.error("[holder] re-sending the holder failed:", (e as Error).message));
+  console.log("[holder] holder sent again with the ID document:", holderFredaId);
+  return true;
+}
+
 /**
  * Freda only issues a card to a holder whose identity is verified by the card provider (verification.tier 2: GET /v1/cards/holders/:id
  * says `verification.ready_for_cards`), even when the holder is `enrolled`. If it is not ready, the holder is sent again (same e-mail,
@@ -136,24 +156,11 @@ async function ensureHolderReady(holder: any, holderFredaId: string, c: Ctx): Pr
     const g: any = await freda.getHolder(holderFredaId);
     const h = g?.holder ?? g;
     const v = h?.verification;
-    console.log("[holder] verification of", holderFredaId, "tier:", String(v?.tier ?? "?"), "ready_for_cards:", String(v?.ready_for_cards ?? "?"));
+    console.log("[holder] fields:", Object.keys(h ?? {}).join(","), "| verification:", JSON.stringify(v ?? null).slice(0, 200), "| tier:", String(v?.tier ?? "?"), "ready_for_cards:", String(v?.ready_for_cards ?? "?"));
     return !v || v.ready_for_cards !== false;
   };
   if (await ready()) return;
-  const last = lastReverify.get(holderFredaId) ?? 0;
-  if (Date.now() - last > 10 * 60_000) {
-    lastReverify.set(holderFredaId, Date.now());
-    // Read the ID photos again from Didit (the whole front and back, not a crop) instead of the copies kept earlier.
-    await L.db.from("profiles").update({ kyc_doc_path: null, kyc_doc_back_path: null }).eq("id", c.userId);
-    const identity = await L.getFredaIdentity(c.userId);
-    if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
-    await freda.createHolder({
-      firstName: holder.first_name, lastName: holder.last_name, email: holder.email, country: holder.country, dob: String(holder.dob).slice(0, 10),
-      identificationNumber: decryptField(holder.id_number), phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
-      address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
-      identity,
-    }).catch((e: unknown) => console.error("[holder] re-sending the holder failed:", (e as Error).message));
-  }
+  await resendHolder(holder, holderFredaId, c);
   for (let i = 0; i < 6; i++) {
     await new Promise((r) => setTimeout(r, 10_000));
     if (await ready()) return;
@@ -671,7 +678,12 @@ export const handlers: Record<string, Handler> = {
         try {
           res = await freda.createCard(cardReq);
         } catch (first) {
-          throw first;
+          // The card provider has not verified this holder's identity yet (Freda: "pas Tier 2"). Sending the holder again with a
+          // legible ID restarts the verification; after a minute the card is asked for once more.
+          if (!(first instanceof FredaError && (first.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(first.message)))) throw first;
+          if (!(await resendHolder(holder, holderFredaId, c))) throw first;
+          await new Promise((r) => setTimeout(r, 60_000));
+          res = await freda.createCard(cardReq);
         }
       } catch (e) {
         if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);
