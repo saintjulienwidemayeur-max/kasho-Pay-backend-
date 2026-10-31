@@ -158,8 +158,6 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   adminDeleteFee: { windowMs: MIN, max: 20 },
   adminAdjustBalance: { windowMs: MIN, max: 10 },
   adminSetUserBlocked: { windowMs: MIN, max: 10 },
-  adminSavePartnerCost: { windowMs: MIN, max: 20 },
-  adminApplyPartnerPlan: { windowMs: MIN, max: 5 },
   adminOverview: { windowMs: MIN, max: 30 },
   adminFredaFunds: { windowMs: MIN, max: 20 },
 };
