@@ -65,6 +65,11 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
       identificationNumber: d.idNumber, phoneShortCode: d.phoneCode, phoneNumber: d.phone.replace(/\D/g, ""),
       address: { street: d.street, city: d.city, state: d.state, postalCode: d.postalCode, country: d.country },
     });
+    // What Freda says about the holder and what we sent as ID (no values: kinds and sizes only), to find why a holder is not verified.
+    const hh = res?.holder ?? res?.profile ?? {};
+    const img = (u: unknown) => (typeof u === "string" ? (u.startsWith("data:") ? `base64:${Math.round(u.length / 1024)}KB` : "https-link") : "none");
+    console.log("[holder] POST /v1/cards/holders ->", res?.already_existed ? "already_existed" : "created", "status:", String(hh.status ?? "?"), "failure_reason:", String(hh.failure_reason ?? "-").slice(0, 200),
+      "| sent identity:", identity.type, "front:", img(identity.imageUrl), "back:", img(identity.imageBackUrl), "country:", identity.country ?? "-", "| fields:", Object.keys(res ?? {}).join(","));
     id = pickId(res); // `id` (mpc_...) is returned at the root; `already_existed: true` also returns the existing id
     const st = String(res?.holder?.status ?? res?.profile?.status ?? "").toLowerCase();
     if (st === "pending" || st === "enrolled") holderStatus = st;
@@ -566,6 +571,7 @@ export const handlers: Record<string, Handler> = {
             const g: any = await freda.getHolder(holder.freda_holder_id);
             const h = g?.holder ?? g;
             const hs = String(h?.status ?? "").toLowerCase();
+            console.log("[holder] GET stored holder", holder.freda_holder_id, "status:", hs || "?", "failure_reason:", String(h?.failure_reason ?? "-").slice(0, 200));
             if (!hs || hs === "enrolled") holderFredaId = holder.freda_holder_id;
             else if (hs === "pending") holderPending = true;
             else console.error("[holder] stored holder is not enrolled, status:", h.status, "reason:", String(h?.failure_reason ?? "").slice(0, 200));
