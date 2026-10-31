@@ -1,8 +1,8 @@
 // Server-only helpers: wallet ledger (atomic Postgres functions), settlement of
 // Freda operations, card synchronisation and user-facing error mapping.
 import { supabaseAdmin } from "./supabase.js";
-import { FredaError, freda, fredaMode, pickArray, pickId } from "./freda.js";
-import { round2 } from "./config.js";
+import { FredaError, freda, fredaMode, pickArray, pickId, readClosure } from "./freda.js";
+import { closureFee, round2 } from "./config.js";
 import { FeeError, loadFeeRules, type FeeRule } from "./fees.js";
 import { isSafeRemoteUrl } from "./security.js";
 import { DiditError } from "./didit.js";
@@ -144,6 +144,12 @@ export async function insertTx(row: Record<string, unknown>) {
 
 export async function patchTx(id: string, patch: Record<string, unknown>) {
   const { error } = await db.from("transactions").update(patch).eq("id", id);
+  if (error) throw error;
+}
+
+/** Corrects the amounts of a row that is still pending (never a settled one: its money has already moved). */
+export async function adjustPendingTx(id: string, patch: { amount?: number; fee?: number }) {
+  const { error } = await db.from("transactions").update(patch).eq("id", id).eq("status", "pending");
   if (error) throw error;
 }
 
@@ -377,8 +383,26 @@ export function readCardDetails(c: any) {
   return { status: normalizeCardStatus(src.status), last4, balance, expiry };
 }
 
+/** Why Freda could not create a card (card.failed webhook). Kept for support: users only see a fixed, translated message. */
+export type CardFailure = { reason?: unknown; link?: unknown; linkExpiresAt?: unknown };
+
+export function cardFailureMeta(f: CardFailure): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (typeof f.reason === "string" && f.reason.trim()) out["card_failure_reason"] = f.reason.trim().slice(0, 300);
+  // A re-verification link Freda offers the holder: only a plain https URL is kept.
+  if (typeof f.link === "string" && f.link.length <= 500) {
+    try {
+      if (new URL(f.link).protocol === "https:") {
+        out["verification_link"] = f.link;
+        if (typeof f.linkExpiresAt === "string" && f.linkExpiresAt.length <= 40) out["verification_link_expires_at"] = f.linkExpiresAt;
+      }
+    } catch { /* not a URL */ }
+  }
+  return out;
+}
+
 /** Apply a Freda card status to our row and settle the creation charge on the first transition. */
-export async function applyCardStatus(card: any, status: string, extra: Record<string, unknown> = {}) {
+export async function applyCardStatus(card: any, status: string, extra: Record<string, unknown> = {}, failure?: CardFailure) {
   const next = normalizeCardStatus(status);
   const patch: Record<string, unknown> = { status: next, ...extra };
   Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
@@ -392,6 +416,12 @@ export async function applyCardStatus(card: any, status: string, extra: Record<s
       }
     } else if (next === "failed") {
       if (await failTx(card.creation_tx_id, "Card creation failed")) {
+        const why = failure ? cardFailureMeta(failure) : {};
+        if (Object.keys(why).length) {
+          console.error("[card] creation failed:", card.id, why["card_failure_reason"] ?? "(no reason given)", why["verification_link"] ? "(re-verification link saved)" : "");
+          const t = await getTx(card.creation_tx_id);
+          if (t) await mergeTxMeta(t, why);
+        }
         await notify(card.user_id, "Card creation failed", "We could not create your card. The money is back in your wallet.");
       }
     }
@@ -403,20 +433,23 @@ export async function applyCardStatus(card: any, status: string, extra: Record<s
  * The card was closed (or deleted) on the Freda side. Block it here, and give the last known
  * balance back to the user's wallet once (Freda returns it to our master wallet on closure).
  */
-export async function markCardGone(card: any) {
+export async function markCardGone(card: any, closure?: { refunded: number; fee: number } | null) {
   if (card.status === "terminated") return card;
   // Atomic: only the caller that flips the status may credit the wallet.
   const { data: flipped } = await db.from("cards").update({ status: "terminated", balance: 0 })
     .eq("id", card.id).neq("status", "terminated").select("id");
   if (!flipped?.length) return { ...card, status: "terminated", balance: 0 };
-  const left = Number(card.balance ?? 0);
+  // Freda keeps a closing fee out of what is left on the card. Use its own figures when it told us (card.terminated
+  // webhook), else our last known balance and the documented fee. The user gets what comes back, no more.
+  const left = closure ? round2(closure.refunded + closure.fee) : Number(card.balance ?? 0);
+  const fee = closure ? closure.fee : closureFee(left);
   if (left > 0 && card.status !== "pending" && card.status !== "failed") {
     const { data: busy } = await db.from("transactions").select("id").eq("card_id", card.id)
       .eq("kind", "card_withdraw").eq("status", "pending").limit(1);
     if (!busy?.length) {
       const tx = await insertTx({
         user_id: card.user_id, kind: "card_withdraw", title: `${card.label} closed`, category: "Card",
-        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount: left, fee: 0, status: "pending", card_id: card.id, provider: "freda",
+        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount: left, fee, status: "pending", card_id: card.id, provider: "freda",
         meta: { terminate: true, closed_by_provider: true },
       });
       if (tx) await completeTx(tx.id);
@@ -424,6 +457,30 @@ export async function markCardGone(card: any) {
   }
   await notify(card.user_id, "Card closed", `${card.label} was closed and can no longer be used.`);
   return { ...card, status: "terminated", balance: 0 };
+}
+
+/**
+ * A card.* webhook event (Freda docs, Notifications). Statuses come from the event; money-moving details do not:
+ *  - card.terminated: refunded_usd + closure_fee_usd say what really came back, the wallet gets exactly that;
+ *  - card.failed: failure_reason / verification_link are kept on the creation transaction (users see a fixed message);
+ *  - card.balance_updated, card.transaction: the real card is re-read from Freda instead of trusting the payload.
+ */
+export async function handleCardEvent(type: string, d: any) {
+  // card.transaction names the card in `card_id` (its `id` is the movement); the other card events use `id`.
+  const fredaCardId = type === "card.transaction" ? d?.card_id : d?.id;
+  if (typeof fredaCardId !== "string" || !fredaCardId) return;
+  const { data: card } = await db.from("cards").select("*").eq("freda_card_id", fredaCardId).maybeSingle();
+  if (!card) return;
+  switch (type) {
+    case "card.terminated": await markCardGone(card, readClosure(d)); break;
+    case "card.failed": await applyCardStatus(card, "failed", {}, { reason: d?.failure_reason, link: d?.verification_link, linkExpiresAt: d?.verification_link_expires_at }); break;
+    case "card.balance_updated":
+    case "card.transaction": await syncCardRow(card); break;
+    case "card.created": await applyCardStatus(card, "active"); break;
+    case "card.frozen": await applyCardStatus(card, "disabled"); break;
+    case "card.unfrozen": await applyCardStatus(card, "active"); break;
+    default: break; // card.funded / card.withdrawn: settled by our own calls and the periodic card sync
+  }
 }
 
 export async function syncCardRow(card: any) {
@@ -590,7 +647,7 @@ export async function applyKycDecision(sessionId: string, userId: string): Promi
     else if (iso2.toUpperCase() === "FRA") patch["country"] = "FR";
     else if (iso2.toUpperCase() === "CAN") patch["country"] = "CA";
     Object.assign(patch, await storeKycDocument(userId, idv));
-    await db.from("profiles").update(patch).eq("id", userId);
+    await updateProfile(userId, patch);
     await notify(userId, "Identity verified", "Your identity has been confirmed.");
   } else if (status === "rejected" && cur?.kyc_status !== "rejected") {
     await db.from("profiles").update({ kyc_status: "rejected" }).eq("id", userId);
@@ -602,7 +659,11 @@ export async function applyKycDecision(sessionId: string, userId: string): Promi
 
 // ---------------------------------------------------------------- ID document for Freda card holders
 const KYC_BUCKET = "kyc-docs";
-export type FredaIdentity = { type: "NIN" | "PASSPORT" | "VOTERS_CARD" | "DRIVERS_LICENSE"; number: string; imageUrl: string; country?: string };
+export type FredaIdentity = {
+  type: "NIN" | "PASSPORT" | "VOTERS_CARD" | "DRIVERS_LICENSE"; number: string; imageUrl: string; country?: string;
+  /** Back of the document: required for some countries, optional for the others (Freda docs, holders). */
+  imageBackUrl?: string;
+};
 
 /** Didit document_type -> Freda identity.type */
 export function mapDocType(t: unknown): FredaIdentity["type"] {
@@ -613,40 +674,77 @@ export function mapDocType(t: unknown): FredaIdentity["type"] {
   return "NIN"; // national identity card
 }
 
-/** Copies the Didit ID image into a private bucket (Didit links expire) and returns the profile fields to save. */
+/** Downloads one Didit ID image into the private bucket and returns its path, or undefined when it could not be stored. */
+async function storeIdImage(userId: string, url: unknown, side: "front" | "back"): Promise<string | undefined> {
+  if (!isSafeRemoteUrl(url)) return undefined;
+  try {
+    const res = await fetch(url as string, { signal: AbortSignal.timeout(20_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length === 0 || buf.length > 8 * 1024 * 1024) throw new Error(`bad size ${buf.length}`);
+    const ct = res.headers.get("content-type")?.split(";")[0] || "image/jpeg";
+    const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
+    const path = `${userId}/id-${side}.${ext}`;
+    await db.storage.createBucket(KYC_BUCKET, { public: false }).catch(() => {}); // already exists is fine
+    const { error } = await db.storage.from(KYC_BUCKET).upload(path, buf, { contentType: ct, upsert: true });
+    if (error) throw error;
+    return path;
+  } catch (e) {
+    console.error(`[kyc] could not store the ID image (${side}):`, (e as Error).message);
+    return undefined;
+  }
+}
+
+/**
+ * Copies the Didit ID images into a private bucket (Didit links expire) and returns the profile fields to save.
+ * `kyc_doc_back_path` is "" when Didit has no back image for this document (a passport): that means "checked, none".
+ */
 export async function storeKycDocument(userId: string, idv: any): Promise<Record<string, unknown>> {
   const out: Record<string, unknown> = {};
   if (!idv) return out;
   out["kyc_doc_type"] = mapDocType(idv.document_type);
-  const url = idv.front_image ?? idv.full_front_image;
-  if (isSafeRemoteUrl(url)) {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length === 0 || buf.length > 8 * 1024 * 1024) throw new Error(`bad size ${buf.length}`);
-      const ct = res.headers.get("content-type")?.split(";")[0] || "image/jpeg";
-      const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
-      const path = `${userId}/id-front.${ext}`;
-      await db.storage.createBucket(KYC_BUCKET, { public: false }).catch(() => {}); // already exists is fine
-      const { error } = await db.storage.from(KYC_BUCKET).upload(path, buf, { contentType: ct, upsert: true });
-      if (error) throw error;
-      out["kyc_doc_path"] = path;
-    } catch (e) {
-      console.error("[kyc] could not store the ID image:", (e as Error).message);
-    }
+  const front = await storeIdImage(userId, idv.front_image ?? idv.full_front_image, "front");
+  if (front) out["kyc_doc_path"] = front;
+  const backUrl = idv.back_image ?? idv.full_back_image;
+  if (!backUrl) out["kyc_doc_back_path"] = "";
+  else {
+    const back = await storeIdImage(userId, backUrl, "back");
+    if (back) out["kyc_doc_back_path"] = back;
   }
   return out;
 }
 
 /**
+ * Saves profile fields. If the database has not received the `kyc_doc_back_path` migration yet, that one field is
+ * dropped instead of losing the whole update (KYC approval must never depend on it).
+ */
+async function updateProfile(userId: string, patch: Record<string, unknown>) {
+  let { error } = await db.from("profiles").update(patch).eq("id", userId);
+  if (error && "kyc_doc_back_path" in patch && /kyc_doc_back_path/.test(error.message)) {
+    const { kyc_doc_back_path: _omit, ...rest } = patch;
+    ({ error } = Object.keys(rest).length ? await db.from("profiles").update(rest).eq("id", userId) : { error: null });
+  }
+  if (error) console.error("[kyc] profile update failed:", error.message);
+}
+
+/**
  * Builds the `identity` object Freda requires on POST /v1/cards/holders from the user's Didit KYC.
- * Users verified before this feature are refreshed from their Didit decision.
+ * Users verified before this feature are refreshed from their Didit decision (front image, and the back when it was never fetched).
  */
 export async function getFredaIdentity(userId: string): Promise<FredaIdentity | null> {
-  const load = async () => (await db.from("profiles").select("id_number, country, kyc_doc_type, kyc_doc_path").eq("id", userId).single()).data;
+  const load = async () => {
+    let r = await db.from("profiles").select("id_number, country, kyc_doc_type, kyc_doc_path, kyc_doc_back_path").eq("id", userId).single();
+    // Migration 20261031000000_kyc_doc_back.sql not run yet: carry on without the back of the document
+    // ("" = nothing to fetch, so Didit is not asked again on every call until the column exists).
+    if (r.error && /kyc_doc_back_path/.test(r.error.message)) {
+      r = await db.from("profiles").select("id_number, country, kyc_doc_type, kyc_doc_path").eq("id", userId).single();
+      if (r.data) r = { ...r, data: { ...r.data, kyc_doc_back_path: "" } };
+    }
+    return r.data;
+  };
   let prof = await load();
-  if (prof && !prof.kyc_doc_path) {
+  // `kyc_doc_back_path` null = never fetched. "" = fetched, the document has no back.
+  if (prof && (!prof.kyc_doc_path || prof.kyc_doc_back_path == null)) {
     try {
       const { data: sub } = await db.from("kyc_submissions").select("didit_session_id").eq("user_id", userId)
         .not("didit_session_id", "is", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
@@ -654,7 +752,7 @@ export async function getFredaIdentity(userId: string): Promise<FredaIdentity | 
         const dec = await getDecision(sub.didit_session_id);
         const idv = Array.isArray(dec?.id_verifications) ? dec.id_verifications[0] : null;
         const patch = await storeKycDocument(userId, idv);
-        if (Object.keys(patch).length) await db.from("profiles").update(patch).eq("id", userId);
+        if (Object.keys(patch).length) await updateProfile(userId, patch);
         prof = await load();
       }
     } catch (e) {
@@ -663,11 +761,14 @@ export async function getFredaIdentity(userId: string): Promise<FredaIdentity | 
   }
   const number = decryptField(prof?.id_number);
   if (!prof?.kyc_doc_path || !number) return null;
-  const { data: signed, error } = await db.storage.from(KYC_BUCKET).createSignedUrl(prof.kyc_doc_path, 24 * 3600);
-  if (error || !signed?.signedUrl) {
-    console.error("[kyc] could not sign the ID image URL:", error?.message);
-    return null;
-  }
+  const sign = async (path: string) => {
+    const { data: signed, error } = await db.storage.from(KYC_BUCKET).createSignedUrl(path, 24 * 3600);
+    if (error || !signed?.signedUrl) console.error("[kyc] could not sign the ID image URL:", error?.message);
+    return signed?.signedUrl as string | undefined;
+  };
+  const imageUrl = await sign(prof.kyc_doc_path);
+  if (!imageUrl) return null;
+  const imageBackUrl = prof.kyc_doc_back_path ? await sign(prof.kyc_doc_back_path) : undefined;
   const country = /^[A-Za-z]{2}$/.test(prof.country ?? "") ? String(prof.country).toUpperCase() : undefined;
-  return { type: mapDocType(prof.kyc_doc_type), number: String(number), imageUrl: signed.signedUrl, country };
+  return { type: mapDocType(prof.kyc_doc_type), number: String(number), imageUrl, ...(imageBackUrl ? { imageBackUrl } : {}), country };
 }

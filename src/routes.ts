@@ -3,8 +3,8 @@
 import { z } from "zod";
 import * as L from "./ledger.js";
 import { readCardDetails } from "./ledger.js";
-import { freda, FredaError, fredaConfigured, fredaMode, pickArray, pickId } from "./freda.js";
-import { getConfig, normalizeHaitiPhone, round2 } from "./config.js";
+import { freda, FredaError, fredaConfigured, fredaMode, pickArray, pickId, readClosure } from "./freda.js";
+import { closureFee, getConfig, normalizeHaitiPhone, round2 } from "./config.js";
 import { FEE_OPERATIONS, TIERED_OPERATIONS, amountRange, computeFee, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import { decryptField, encryptField, hashCardCode, verifyCardCode } from "./crypto.js";
 import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup.js";
@@ -167,6 +167,7 @@ export const handlers: Record<string, Handler> = {
         maxWithdrawUsd: wd?.max ?? null,
         minCardFundUsd: c.minCardFundUsd,
         minCardPrefundUsd: c.minCardPrefundUsd,
+        cardClosureFeeUsd: c.cardClosureFeeUsd,
         requireKycForCards: c.requireKycForCards,
         sandbox: fredaConfigured() ? fredaMode() === "sandbox" : true,
         pushPublicKey: pushPublicKey(),
@@ -789,7 +790,7 @@ export const handlers: Record<string, Handler> = {
       // Stuck cards (never created, failed, or unknown to the provider) can always be removed.
       if (!card.freda_card_id || card.status === "failed") {
         await L.db.from("cards").update({ status: "terminated", balance: 0 }).eq("id", card.id);
-        return { refunded: 0 };
+        return { refunded: 0, fee: 0 };
       }
       let remote: any;
       try {
@@ -797,27 +798,45 @@ export const handlers: Record<string, Handler> = {
       } catch (e) {
         if (e instanceof FredaError && e.status === 404) {
           const gone = await L.markCardGone(card);
-          return { refunded: Number(card.balance ?? 0) > 0 && gone.status === "terminated" ? Number(card.balance) : 0 };
+          const left = Number(card.balance ?? 0);
+          const fee = closureFee(left);
+          return gone.status === "terminated" && left > 0 ? { refunded: round2(left - fee), fee } : { refunded: 0, fee: 0 };
         }
         throw e;
       }
       if (remote.status === "terminated") {
-        await L.markCardGone({ ...card, balance: remote.balance ?? card.balance });
-        return { refunded: Number(remote.balance ?? card.balance ?? 0) };
+        const left = Number(remote.balance ?? card.balance ?? 0);
+        await L.markCardGone({ ...card, balance: left });
+        const fee = closureFee(left);
+        return { refunded: round2(left - fee), fee };
       }
-      // Freda returns the remaining balance to the Master Wallet: mirror it into the user's wallet.
+      // Freda keeps a closing fee out of what is left on the card and returns the rest to the Master Wallet:
+      // mirror exactly that into the user's wallet.
       const remaining = remote.balance ?? Number(card.balance ?? 0);
+      let fee = closureFee(remaining);
+      let gross = remaining;
       // Ledger row first (pending), then the provider call, so a crash in between is recovered by reconcile().
       const tx = remaining > 0 ? await L.insertTx({
         user_id: c.userId, kind: "card_withdraw", title: `${card.label} closed`, category: "Card",
-        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount: remaining, fee: 0, status: "pending", card_id: card.id, provider: "freda",
+        method: `Card •••• ${card.last4 ?? ""}`.trim(), amount: remaining, fee, status: "pending", card_id: card.id, provider: "freda",
         meta: { terminate: true },
       }) : null;
+      let closed: any;
       try {
-        await freda.terminateCard(card.freda_card_id);
+        closed = await freda.terminateCard(card.freda_card_id);
       } catch (e) {
         if (tx && !(e instanceof FredaError && e.ambiguous)) await L.failTx(tx.id, "Provider rejected the closure");
         throw e;
+      }
+      // Freda's answer says what it really did (refunded_usd + closure_fee_usd): the row follows it.
+      const real = readClosure(closed);
+      if (tx && real) {
+        const realGross = round2(real.refunded + real.fee);
+        if (realGross !== gross || real.fee !== fee) {
+          await L.adjustPendingTx(tx.id, { amount: realGross, fee: real.fee });
+          gross = realGross;
+          fee = real.fee;
+        }
       }
       // Confirm with Freda that the card is really closed before showing it as terminated.
       try {
@@ -837,7 +856,7 @@ export const handlers: Record<string, Handler> = {
         else await L.completeTx(tx.id);
       }
       await L.notify(c.userId, "Card closed", `${card.label} was closed permanently.`);
-      return { refunded: remaining };
+      return { refunded: round2(gross - fee), fee };
     },
   },
 

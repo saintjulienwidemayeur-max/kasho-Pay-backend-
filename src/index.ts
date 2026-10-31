@@ -4,7 +4,8 @@ import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { supabaseAdmin } from "./supabase.js";
 import * as L from "./ledger.js";
-import { fredaConfigured, fredaMode, verifyWebhookSignature } from "./freda.js";
+import { freda, fredaConfigured, fredaMode, readMasterWallet, verifyWebhookSignature } from "./freda.js";
+import { getConfig } from "./config.js";
 import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
@@ -83,13 +84,7 @@ app.post("/api/webhooks/freda", express.raw({ type: "*/*", limit: "1mb" }), asyn
           await L.settleTransaction(tx); // re-reads the real state from Freda instead of trusting the payload
         }
       } else if (type.startsWith("card.")) {
-        const { data: card } = await L.db.from("cards").select("*").eq("freda_card_id", d.id ?? "").maybeSingle();
-        const map: Record<string, string> = {
-          "card.created": "active", "card.failed": "failed", "card.frozen": "disabled",
-          "card.unfrozen": "active", "card.terminated": "terminated",
-        };
-        if (card && type === "card.terminated") await L.markCardGone(card);
-        else if (card && map[type]) await L.applyCardStatus(card, map[type]!);
+        await L.handleCardEvent(type, d);
       }
     } catch (e) {
       console.error("[webhook] processing error", type, (e as Error)?.message);
@@ -323,6 +318,24 @@ async function reconcile() {
   }
 }
 
+// ---------------------------------------------------------------- Master Wallet watch
+// Cards are paid from the Master Wallet. Freda keeps a guarantee deposit locked in it (50 USD by default): only
+// `spendable` can pay for card creations and top-ups, below that Freda answers BELOW_MINIMUM_BALANCE. Warn before it happens.
+async function watchMasterWallet(announce = false) {
+  if (!fredaConfigured()) return;
+  try {
+    const w = readMasterWallet(await freda.masterWallet());
+    if (!w) return;
+    const line = `balance $${w.balance.toFixed(2)}, guarantee $${w.guarantee.toFixed(2)} (locked), spendable $${w.spendable.toFixed(2)}`;
+    if (announce) console.log(`  Master Wallet: ${line}`);
+    if (w.low || w.spendable < getConfig().masterWalletAlertUsd) {
+      console.error(`[master-wallet] LOW: ${line}. Top it up, or card creations and top-ups will be refused (BELOW_MINIMUM_BALANCE).`);
+    }
+  } catch (e) {
+    console.error("[master-wallet]", (e as Error).message);
+  }
+}
+
 // ---------------------------------------------------------------- start
 const port = Number(process.env["PORT"] ?? 4000);
 app.listen(port, () => {
@@ -343,6 +356,8 @@ app.listen(port, () => {
     for (const i of list ?? []) if (i.family === "IPv4" && !i.internal) console.log(`  On your network: http://${i.address}:${port}/health`);
   }
   setInterval(reconcile, 30_000);
+  void watchMasterWallet(true);
+  setInterval(() => { void watchMasterWallet(); }, 30 * 60_000);
   const push = initPush();
   if (push.configured) {
     console.log("  Web Push     : configured (morning greeting + transaction notifications)");
