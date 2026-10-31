@@ -491,6 +491,40 @@ export const handlers: Record<string, Handler> = {
       const label = d.label?.trim() || "Kasho virtual debit";
       const fee = computeFee(await L.feeRules(), "card_creation", amount); // read before any holder / card is created
 
+      // Cheap check kept in the request: a profile that lacks what Freda requires is refused at once, before anything is charged.
+      {
+        const { data: h0 } = await L.db.from("card_holders").select("id").eq("user_id", c.userId).eq("mode", fredaMode()).limit(1);
+        if (!h0?.length) {
+          const chk = holderInput.safeParse({
+            firstName: profile?.first_name, lastName: profile?.last_name, email: c.email, dob: profile?.date_of_birth, country: profile?.country,
+            idNumber: decryptField(profile?.id_number), phoneCode: profile?.phone_code, phone: profile?.phone_number,
+            street: profile?.address_street, city: profile?.address_city, state: profile?.address_state, postalCode: profile?.address_postal_code,
+          });
+          if (!chk.success) {
+            const names: Record<string, string> = { firstName: "first name", lastName: "last name", dob: "date of birth", country: "country", idNumber: "ID number",
+              phoneCode: "phone code", phone: "phone number", street: "street address", city: "city", state: "state", postalCode: "postal code", email: "email" };
+            throw new L.AppError(`Please complete your profile: ${[...new Set(chk.error.issues.map((i) => names[String(i.path[0])] ?? String(i.path[0])))].join(", ")}.`);
+          }
+        }
+      }
+      const cardId = crypto.randomUUID();
+      const reference = `kasho_card_${cardId}`;
+
+      const txId = await L.debit({
+        user: c.userId, kind: "card_creation", title: `New card: ${label}`, category: "Card", method: "Wallet",
+        amount, fee, status: "pending", meta: { label },
+      });
+      const { error: insErr } = await L.db.from("cards").insert({
+        id: cardId, user_id: c.userId, reference, label, color: d.color, brand: d.brand, status: "pending", creation_tx_id: txId,
+      });
+      if (insErr) {
+        await L.failTx(txId, "Could not save card");
+        throw insErr;
+      }
+      await L.db.from("transactions").update({ card_id: cardId }).eq("id", txId);
+      // Everything slow (holder, ID image, Freda) runs after the answer: the customer gets the pending card at once and the app waits for it
+      // (the same sync that settles any pending card). A refusal gives the money back and tells the customer.
+      const finish = async (): Promise<void> => {
       const mode = fredaMode();
       // The customer never picks a card holder: the latest one for this account is used, or one is created automatically.
       const { data: holders } = await L.db.from("card_holders").select("*").eq("user_id", c.userId).eq("mode", mode)
@@ -584,23 +618,9 @@ export const handlers: Record<string, Handler> = {
         if (holder.freda_holder_id !== holderFredaId) await L.db.from("card_holders").update({ freda_holder_id: holderFredaId }).eq("id", holder.id);
       }
 
-      const cardId = crypto.randomUUID();
-      const reference = `kasho_card_${cardId}`;
-
-      const txId = await L.debit({
-        user: c.userId, kind: "card_creation", title: `New card: ${label}`, category: "Card", method: "Wallet",
-        amount, fee, status: "pending", meta: { label, holder_id: holderFredaId },
-      });
-      const { error: insErr } = await L.db.from("cards").insert({
-        id: cardId, user_id: c.userId, reference, label, color: d.color, brand: d.brand, status: "pending", creation_tx_id: txId,
-      });
-      if (insErr) {
-        await L.failTx(txId, "Could not save card");
-        throw insErr;
-      }
-      await L.db.from("transactions").update({ card_id: cardId }).eq("id", txId);
 
       // Always send the exact holder_id of THIS user's enrolled holder (the account default may belong to another user).
+      await L.mergeTxMeta(await L.getTx(txId), { holder_id: holderFredaId });
       const cardReq = { reference, kind: "individual" as const, brand: d.brand, amount, holder_id: holderFredaId };
       let res: any;
       try {
@@ -612,13 +632,10 @@ export const handlers: Record<string, Handler> = {
           // (same `reference`: never a second card) until Freda answers. The customer is NOT told to try again: that would charge twice.
           await L.rememberCardProblem(txId, e);
           console.error("[card] the outcome of POST /v1/cards is unknown, it will be retried:", reference);
-          return { cardId, transactionId: txId as string };
+          return;
         }
         // Refused for good: the money goes back now, and Freda's reason is kept on the ledger row for support.
-        await L.rememberCardProblem(txId, e);
-        await L.failTx(txId, "Provider rejected the card");
-        await L.db.from("cards").update({ status: "failed" }).eq("id", cardId);
-        throw e;
+        throw e; // the caller gives the money back and tells the customer
       }
       // From here the card exists at Freda: nothing below may fail the transaction or give the money back. If recording it here
       // goes wrong, the periodic sync finishes the job (it asks Freda again).
@@ -638,6 +655,18 @@ export const handlers: Record<string, Handler> = {
       } catch (e) {
         console.error("[card] created at Freda but not fully recorded yet, the sync will finish it:", reference, (e as Error).message);
       }
+      };
+      void finish().catch(async (e) => {
+        if (e instanceof FredaError && e.ambiguous) return; // unknown outcome: stays pending, the periodic pass retries
+        try {
+          console.error("[card] creation failed:", reference, (e as Error).message);
+          await L.rememberCardProblem(txId, e);
+          if (await L.failTx(txId, "Card creation failed")) {
+            await L.db.from("cards").update({ status: "failed" }).eq("id", cardId);
+            await L.notify(c.userId, "Card creation failed", "We could not create your card. The money is back in your wallet.");
+          }
+        } catch (e2) { console.error("[card] could not close a failed creation:", (e2 as Error).message); }
+      });
       return { cardId, transactionId: txId as string };
     },
   },

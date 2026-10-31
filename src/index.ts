@@ -373,6 +373,13 @@ app.listen(port, () => {
     for (const i of list ?? []) if (i.family === "IPv4" && !i.internal) console.log(`  On your network: http://${i.address}:${port}/health`);
   }
   setInterval(reconcile, 30_000);
+  // Render's free plan puts a service to sleep after ~15 minutes without a request from outside. While it is awake it asks for its own
+  // public address every 5 minutes (Render sets RENDER_EXTERNAL_URL; KEEP_ALIVE_URL overrides it, KEEP_ALIVE=false turns it off).
+  const keepAlive = (process.env["KEEP_ALIVE_URL"] ?? process.env["RENDER_EXTERNAL_URL"] ?? "").replace(/\/+$/, "");
+  if (production && keepAlive.startsWith("https://") && (process.env["KEEP_ALIVE"] ?? "true").toLowerCase() !== "false") {
+    console.log(`  Keep-alive   : ${keepAlive}/health every 5 minutes`);
+    setInterval(() => { fetch(`${keepAlive}/health`, { signal: AbortSignal.timeout(20_000) }).catch((e) => console.error("[keep-alive]", (e as Error).message)); }, 5 * 60_000).unref();
+  }
   void watchMasterWallet(true);
   setInterval(() => { void watchMasterWallet(); }, 30 * 60_000);
   const push = initPush();
