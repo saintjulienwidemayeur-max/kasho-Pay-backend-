@@ -23,10 +23,24 @@ export class FredaError extends Error {
    */
   get ambiguous(): boolean {
     if (this.code === "NETWORK") return true;
+    // Nothing left this server (no API key): the call cannot have been executed.
+    if (this.code === "NOT_CONFIGURED") return false;
     // 503 CARD_PROVIDER_AUTH / CARD_LIVE_NOT_CONFIGURED are documented as "nothing was debited".
     if (this.code === "CARD_PROVIDER_AUTH" || this.code === "CARD_LIVE_NOT_CONFIGURED") return false;
+    // POST /v1/cards documents 502/503 CARD_SERVICE_ERROR the same way: "nothing is debited (or refunded at once)". Treating it
+    // as an unknown outcome left a card "in creation" for ever whenever the card service kept refusing the request.
+    if (this.code === "CARD_SERVICE_ERROR" && this.endpoint === "POST /v1/cards") return false;
     return this.status >= 500;
   }
+}
+
+/** What went wrong with a Freda call, short enough to keep on a ledger row and to show an administrator (never the request body). */
+export function describeFredaError(e: unknown): { code: string; status: number; message: string; endpoint: string; at: string } {
+  const fe = e instanceof FredaError ? e : null;
+  return {
+    code: fe?.code ?? "ERROR", status: fe?.status ?? 0, endpoint: fe?.endpoint ?? "",
+    message: String(fe?.message ?? (e as Error)?.message ?? e).slice(0, 200), at: new Date().toISOString(),
+  };
 }
 
 function apiKey(): string {

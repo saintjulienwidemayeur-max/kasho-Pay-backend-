@@ -1,12 +1,13 @@
 // Server-only helpers: wallet ledger (atomic Postgres functions), settlement of
 // Freda operations, card synchronisation and user-facing error mapping.
 import { supabaseAdmin } from "./supabase.js";
-import { FredaError, freda, fredaMode, pickArray, pickId, readClosure } from "./freda.js";
+import { FredaError, describeFredaError, freda, fredaMode, pickArray, pickId, readClosure } from "./freda.js";
 import { closureFee, round2 } from "./config.js";
 import { FeeError, loadFeeRules, type FeeRule } from "./fees.js";
 import { isSafeRemoteUrl } from "./security.js";
 import { DiditError } from "./didit.js";
 import { sendPushToUser } from "./push.js";
+import { mentionsIdentityVerification, pickVerification, type Verification } from "./verification.js";
 
 // supabaseAdmin is intentionally loosely typed here (rpc results, jsonb meta).
 export const db: any = supabaseAdmin;
@@ -48,6 +49,8 @@ const FREDA_USER_MESSAGES: Record<string, string> = {
   INDIVIDUAL_CARD_DETAILS_HIDDEN: "Card details are not available for this card.",
 };
 const GENERIC_FREDA = "We could not complete this request. Please try again or contact support.";
+/** The card service wants the holder to complete an identity verification first (HOLDER_NOT_ENROLLED, or Freda's text says so). */
+export const IDENTITY_VERIFICATION_MESSAGE = "The card service must verify your identity first. Please try again in a few minutes, or contact support if this continues.";
 
 /** Codes a payment can come back with when the payer's mobile money account is short of funds. */
 const PAYER_FUNDS_CODES = new Set(["INSUFFICIENT_FUNDS", "PAYMENT_FAILED", "PROVIDER_ERROR"]);
@@ -65,6 +68,7 @@ export function toUserError(e: any): Error {
 
   if (e instanceof FredaError) {
     console.error("[freda]", e.endpoint, e.status, e.code, e.message); // endpoint/code/status/message only: never the body
+    if (e.code === "HOLDER_NOT_ENROLLED" || mentionsIdentityVerification(e.message)) return new AppError(IDENTITY_VERIFICATION_MESSAGE);
     if (isPayerInsufficientFunds(e)) {
       return new AppError("The balance on your mobile money account is too low for this payment. Add funds and try again.");
     }
@@ -148,7 +152,7 @@ export async function patchTx(id: string, patch: Record<string, unknown>) {
 }
 
 /**
- * Remembers what Freda really charged for a settled operation (read by the profit report in the admin page).
+ * Remembers what Freda really charged for a settled operation (kept for an exact report later).
  * Only finite, non-negative numbers are kept. Never blocks or fails the money flow it is called from.
  */
 export async function recordProviderFee(txId: string, patch: Record<string, unknown>) {
@@ -309,9 +313,13 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
       try {
         res = await freda.createCard({ reference: card.reference, kind: "individual", brand: card.brand, amount: Math.abs(Number(tx.amount)), holder_id: holderId });
       } catch (e) {
-        if (e instanceof FredaError && e.ambiguous) return "pending";
+        if (e instanceof FredaError && e.ambiguous) {
+          await trackPendingCard(card, { error: e }); // still unknown: say why it does not move, and try again next round
+          return "pending";
+        }
         if (e instanceof FredaError) {
           console.error("[card_creation] replay rejected:", tx.reference, e.status, e.code);
+          await rememberCardProblem(tx.id, e);
           await db.from("cards").update({ status: "failed" }).eq("id", card.id);
           if (await failTx(tx.id, "Provider rejected the card")) {
             await notify(tx.user_id, "Card creation failed", "We could not create your card. The money is back in your wallet.");
@@ -320,7 +328,10 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
         }
         throw e;
       }
-      if (!res?.id) return "pending";
+      if (!res?.id) {
+        console.error("[card_creation] replay answered without a card id:", tx.reference, Object.keys(res ?? {}).join(","));
+        return "pending";
+      }
       await db.from("cards").update({ freda_card_id: res.id }).eq("id", card.id);
       card = { ...card, freda_card_id: res.id };
       if (res?.status && normalizeCardStatus(res.status) !== "pending") card = await applyCardStatus(card, res.status);
@@ -381,8 +392,15 @@ export function normalizeCardStatus(raw: unknown): "pending" | "active" | "disab
   if (s === "disabled" || s === "frozen" || s === "inactive") return "disabled";
   if (s === "terminated" || s === "closed") return "terminated";
   if (s === "failed" || s === "error") return "failed";
+  // "pending" is the documented in-progress state. Anything else is a status this code does not know: it stays "pending" (a card is
+  // never assumed to work) but it is said once in the log, so a new Freda status is noticed instead of leaving cards "in creation".
+  if (s && s !== "pending" && !warnedStatuses.has(s)) {
+    warnedStatuses.add(s);
+    console.error("[card] unknown Freda card status, kept as pending:", s.slice(0, 40));
+  }
   return "pending";
 }
+const warnedStatuses = new Set<string>();
 
 export function readCardDetails(c: any) {
   const src = c?.card ?? c ?? {};
@@ -425,6 +443,12 @@ export function cardFailureMeta(f: CardFailure): Record<string, unknown> {
 /** Apply a Freda card status to our row and settle the creation charge on the first transition. */
 export async function applyCardStatus(card: any, status: string, extra: Record<string, unknown> = {}, failure?: CardFailure) {
   const next = normalizeCardStatus(status);
+  // A card that failed (its money is already back in the customer's wallet) is never brought back to life by a later answer: that would
+  // be a card nobody paid for. It is said in the log, so someone looks at the card that Freda still has.
+  if (card.status === "failed" && next !== "failed") {
+    console.error("[card] ignoring the status", next, "for a card that already failed (money returned):", card.reference);
+    return card;
+  }
   const patch: Record<string, unknown> = { status: next, ...extra };
   Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
   const { error } = await db.from("cards").update(patch).eq("id", card.id);
@@ -443,7 +467,13 @@ export async function applyCardStatus(card: any, status: string, extra: Record<s
           const t = await getTx(card.creation_tx_id);
           if (t) await mergeTxMeta(t, why);
         }
-        await notify(card.user_id, "Card creation failed", "We could not create your card. The money is back in your wallet.");
+        if (why["verification_link"]) {
+          await notify(card.user_id, "Identity verification needed", "The card service must verify your identity before it can issue your card. Open Cards to continue. Your money is back in your wallet.");
+        } else if (mentionsIdentityVerification(why["card_failure_reason"])) {
+          await notify(card.user_id, "Identity verification needed", "The card service could not verify your identity, so your card was not issued. Please contact support. Your money is back in your wallet.");
+        } else {
+          await notify(card.user_id, "Card creation failed", "We could not create your card. The money is back in your wallet.");
+        }
       }
     }
   }
@@ -502,20 +532,116 @@ async function recordCardEvent(card: any, d: any) {
  *  - card.balance_updated, card.transaction: the real card is re-read from Freda instead of trusting the payload.
  */
 export async function handleCardEvent(type: string, d: any) {
-  // card.transaction names the card in `card_id` (its `id` is the movement); the other card events use `id`.
-  const fredaCardId = type === "card.transaction" ? d?.card_id : d?.id;
-  if (typeof fredaCardId !== "string" || !fredaCardId) return;
-  const { data: card } = await db.from("cards").select("*").eq("freda_card_id", fredaCardId).maybeSingle();
-  if (!card) return;
+  const card = await findCardForEvent(type, d);
+  if (!card) {
+    // Said in the log (an event that matches no card used to vanish silently); the periodic sync settles the card anyway.
+    console.error("[webhook] card event for a card we do not know:", type, String(type === "card.transaction" ? d?.card_id : d?.id ?? "").slice(0, 60), String(d?.reference ?? "").slice(0, 80));
+    return;
+  }
   switch (type) {
     case "card.terminated": await markCardGone(card, readClosure(d)); break;
-    case "card.failed": await applyCardStatus(card, "failed", {}, { reason: d?.failure_reason, link: d?.verification_link, linkExpiresAt: d?.verification_link_expires_at }); break;
+    case "card.failed": {
+      const v = pickVerification(d);
+      await applyCardStatus(card, "failed", {}, { reason: v.reason ?? d?.failure_reason, link: v.link ?? d?.verification_link, linkExpiresAt: v.expiresAt ?? d?.verification_link_expires_at });
+      break;
+    }
     case "card.balance_updated": await syncCardRow(card); break;
     case "card.transaction": await recordCardEvent(card, d); await syncCardRow(card); break;
     case "card.created": await applyCardStatus(card, "active"); break;
     case "card.frozen": await applyCardStatus(card, "disabled"); break;
     case "card.unfrozen": await applyCardStatus(card, "active"); break;
     default: break; // card.funded / card.withdrawn: settled by our own calls and the periodic card sync
+  }
+}
+
+/**
+ * The card a webhook event is about: by the Freda card id, else by the `reference` we sent when we asked for the card.
+ * Freda answers POST /v1/cards with 202 and creates the card in the background, so card.created can arrive before we have saved the
+ * card id; the reference is ours, so the card is still found, and its id is remembered from then on.
+ */
+export async function findCardForEvent(type: string, d: any): Promise<any | null> {
+  // card.transaction names the card in `card_id` (its `id` is the movement); the other card events use `id`.
+  const fredaCardId = type === "card.transaction" ? d?.card_id : d?.id;
+  const id = typeof fredaCardId === "string" && fredaCardId ? fredaCardId : "";
+  if (id) {
+    const { data } = await db.from("cards").select("*").eq("freda_card_id", id).maybeSingle();
+    if (data) return data;
+  }
+  const ref = typeof d?.reference === "string" ? d.reference.slice(0, 100) : "";
+  if (!ref) return null;
+  const { data } = await db.from("cards").select("*").eq("reference", ref).maybeSingle();
+  if (!data) return null;
+  if (!data.freda_card_id && id) {
+    const { error } = await db.from("cards").update({ freda_card_id: id }).eq("id", data.id);
+    if (!error) data.freda_card_id = id;
+  }
+  return data;
+}
+
+/** A card that is still "pending" after this long is flagged for review, and the customer is told (once). */
+export const CARD_PENDING_REVIEW_MS = 15 * 60_000;
+
+/**
+ * Keeps on the creation ledger row what Freda last said about a card that is still pending, or why we could not read it, so an
+ * administrator can see why it does not move. After CARD_PENDING_REVIEW_MS the row is flagged `needs_review` and the customer is told
+ * once that it takes longer than usual. Never throws: bookkeeping must not break the sync it is called from.
+ */
+export async function trackPendingCard(card: any, seen: { fredaStatus?: string; error?: unknown; verification?: Verification }) {
+  try {
+    if (!card?.creation_tx_id) return;
+    const tx = await getTx(card.creation_tx_id);
+    if (!tx || tx.status !== "pending") return;
+    const now = Date.now();
+    const patch: Record<string, unknown> = {};
+    let changed = false;
+    if (seen.fredaStatus !== undefined) {
+      changed = tx.meta?.card_freda_status !== seen.fredaStatus || !!tx.meta?.card_problem;
+      patch["card_freda_status"] = seen.fredaStatus;
+      patch["card_problem"] = null;
+    }
+    if (seen.error !== undefined) {
+      const problem = describeFredaError(seen.error);
+      changed = changed || tx.meta?.card_problem?.code !== problem.code || tx.meta?.card_problem?.status !== problem.status;
+      patch["card_problem"] = problem;
+    }
+    // The card service waits for the holder to complete an identity verification: keep the reason and the link, and tell the customer once.
+    const ver = seen.verification;
+    if (ver && (ver.link || ver.reason)) {
+      const why = cardFailureMeta({ reason: ver.reason, link: ver.link, linkExpiresAt: ver.expiresAt });
+      for (const [k, v] of Object.entries(why)) if (tx.meta?.[k] !== v) { changed = true; patch[k] = v; }
+      if (ver.link && !tx.meta?.verification_notified) {
+        patch["verification_notified"] = true;
+        await notify(card.user_id, "Identity verification needed", "The card service must verify your identity before it can issue your card. Open Cards to continue.");
+      }
+    }
+    const age = now - Date.parse(String(card.created_at));
+    const late = Number.isFinite(age) && age > CARD_PENDING_REVIEW_MS && !tx.meta?.needs_review;
+    if (late) {
+      patch["needs_review"] = true;
+      const problem = seen.error !== undefined ? describeFredaError(seen.error) : tx.meta?.card_problem;
+      console.error(`[card] still pending after ${Math.round(age / 60_000)} min: ${card.reference} freda id: ${card.freda_card_id ?? "(none yet)"} freda status: ${seen.fredaStatus ?? tx.meta?.card_freda_status ?? "(unknown)"}${problem?.code ? ` last error: ${problem.code} ${problem.status}` : ""}`);
+      if (!tx.meta?.delay_notified) {
+        patch["delay_notified"] = true;
+        await notify(card.user_id, "Your card is taking longer than usual", "We are still creating your card. Your money is safe: if the card cannot be created, it goes back to your wallet.");
+      }
+    }
+    // Nothing new and checked a moment ago: no need to write the row again (the customer's app asks every few seconds).
+    const lastCheck = Date.parse(String(tx.meta?.card_checked_at ?? "")) || 0;
+    if (!changed && !late && now - lastCheck < 60_000) return;
+    patch["card_checked_at"] = new Date(now).toISOString();
+    await mergeTxMeta(tx, patch);
+  } catch (e) {
+    console.error("[card] could not record the state of a pending card:", (e as Error).message);
+  }
+}
+
+/** Keeps Freda's refusal on the creation ledger row (code, status, short message), for support. Never throws. */
+export async function rememberCardProblem(txId: string, e: unknown) {
+  try {
+    const tx = await getTx(txId);
+    if (tx) await mergeTxMeta(tx, { card_problem: describeFredaError(e) });
+  } catch (err) {
+    console.error("[card] could not record the problem of a card request:", (err as Error).message);
   }
 }
 
@@ -527,11 +653,43 @@ export async function syncCardRow(card: any) {
   } catch (e) {
     // Freda no longer knows this card: it was closed there, so block it here too.
     if (e instanceof FredaError && e.status === 404 && card.status !== "pending") return markCardGone(card);
+    if (card.status === "pending") await trackPendingCard(card, { error: e }); // why a new card does not move
     throw e;
   }
   const d = readCardDetails(c);
   if (d.status === "terminated") return markCardGone(card);
-  return applyCardStatus(card, d.status, { last4: d.last4, expiry: d.expiry, balance: d.balance });
+  const src = c?.card ?? c ?? {};
+  // GET /v1/cards/:id carries `failure_reason` when the creation failed, and may carry the identity verification link the holder has
+  // to open: keep both, like the card.failed webhook does.
+  const ver = pickVerification(c);
+  const next = await applyCardStatus(card, d.status, { last4: d.last4, expiry: d.expiry, balance: d.balance }, d.status === "failed" ? { reason: ver.reason ?? src.failure_reason, link: ver.link, linkExpiresAt: ver.expiresAt } : undefined);
+  if (card.status === "pending" && d.status === "pending") await trackPendingCard(card, { fredaStatus: String(src.status ?? "pending").slice(0, 40), verification: ver });
+  return next;
+}
+
+/**
+ * Settles the cards that are still "pending", on their own and newest first. They used to share one query with the deposits and
+ * withdrawals (oldest first, 25 rows): enough old unpaid deposits and a new card was never looked at again.
+ * Cards older than an hour are looked at every ~5 minutes (tick % 10), those older than 14 days no longer.
+ */
+export async function settlePendingCards(tick: number) {
+  const now = Date.now();
+  const { data: cards, error } = await db.from("cards").select("*").eq("status", "pending")
+    .gt("created_at", new Date(now - 14 * 24 * 3600_000).toISOString())
+    .lt("created_at", new Date(now - 10_000).toISOString())
+    .order("created_at", { ascending: false }).limit(40);
+  if (error) { console.error("[card-sync] could not list the pending cards:", error.message); return; }
+  for (const card of cards ?? []) {
+    if (now - Date.parse(String(card.created_at)) > 3600_000 && tick % 10 !== 0) continue;
+    try {
+      const tx = card.creation_tx_id ? await getTx(card.creation_tx_id) : null;
+      if (tx?.status === "pending") await settleTransaction(tx); // asks for the card again when its id was never saved, else reads its state
+      else if (tx?.status === "failed") await db.from("cards").update({ status: "failed" }).eq("id", card.id).eq("status", "pending"); // money already back
+      else await syncCardRow(card);
+    } catch (e) {
+      console.error("[card-sync] pending card", card.reference, (e as Error).message);
+    }
+  }
 }
 
 export const holderExists = (e: unknown) => e instanceof FredaError && /existe d[ée]j[àa]|already exist/i.test(e.message);
@@ -802,9 +960,26 @@ export async function getFredaIdentity(userId: string): Promise<FredaIdentity | 
     if (error || !signed?.signedUrl) console.error("[kyc] could not sign the ID image URL:", error?.message);
     return signed?.signedUrl as string | undefined;
   };
-  const imageUrl = await sign(prof.kyc_doc_path);
+  // Freda's documented format is Base64 (data:image/jpeg;base64,...), about 700 KB at most. A larger image goes as a signed https link,
+  // which Freda downloads and converts itself.
+  const asData = async (path: string): Promise<string | undefined> => {
+    try {
+      const { data: blob, error } = await db.storage.from(KYC_BUCKET).download(path);
+      if (error || !blob) return undefined;
+      const buf = Buffer.from(await blob.arrayBuffer());
+      if (buf.length === 0 || buf.length > 700 * 1024) return undefined;
+      const t = String(blob.type || "").split(";")[0];
+      const mime = /^image\/(jpeg|png|webp)$/.test(t) ? t : path.endsWith(".png") ? "image/png" : path.endsWith(".webp") ? "image/webp" : "image/jpeg";
+      return `data:${mime};base64,${buf.toString("base64")}`;
+    } catch (e) {
+      console.error("[kyc] could not read the ID image as Base64:", (e as Error).message);
+      return undefined;
+    }
+  };
+  const image = async (path: string) => (await asData(path)) ?? (await sign(path));
+  const imageUrl = await image(prof.kyc_doc_path);
   if (!imageUrl) return null;
-  const imageBackUrl = prof.kyc_doc_back_path ? await sign(prof.kyc_doc_back_path) : undefined;
+  const imageBackUrl = prof.kyc_doc_back_path ? await image(prof.kyc_doc_back_path) : undefined;
   const country = /^[A-Za-z]{2}$/.test(prof.country ?? "") ? String(prof.country).toUpperCase() : undefined;
   return { type: mapDocType(prof.kyc_doc_type), number: String(number), imageUrl, ...(imageBackUrl ? { imageBackUrl } : {}), country };
 }

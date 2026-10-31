@@ -104,6 +104,11 @@ const SAMPLES: Record<string, string[]> = {
   "Card funded": ["$20.00 added to My card."],
   "Card creation failed": ["We could not create your card. The money is back in your wallet."],
   "Card withdrawal completed": ["$7.50 returned to your wallet."],
+  "Identity verification needed": [
+    "The card service must verify your identity before it can issue your card. Open Cards to continue. Your money is back in your wallet.",
+    "The card service could not verify your identity, so your card was not issued. Please contact support. Your money is back in your wallet.",
+    "The card service must verify your identity before it can issue your card. Open Cards to continue."],
+  "Your card is taking longer than usual": ["We are still creating your card. Your money is safe: if the card cannot be created, it goes back to your wallet."],
   "Card ready": ["My card is active and ready to use."],
   "Card closed": ["My card was closed and can no longer be used.", "My card was closed permanently."],
   "Identity verified": ["Your identity has been confirmed."],

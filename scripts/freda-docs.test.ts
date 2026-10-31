@@ -225,8 +225,21 @@ test("webhook card.failed: the reason and the re-verification link are kept on t
     holder_id: "mpc_1", card_failure_reason: "face manquante",
     verification_link: "https://verify.example.com/s/abc", verification_link_expires_at: "2026-11-02T10:00:00Z",
   } }]);
-  assert.deepEqual(inserted(f, "notifications")[0], { user_id: "u1", title: "Card creation failed", body: "We could not create your card. The money is back in your wallet." },
-    "users still see the fixed, translated message");
+  // The customer is told what to do (the link itself is shown in the app by cardVerificationFn, never put in a notification text).
+  assert.deepEqual(inserted(f, "notifications")[0], { user_id: "u1", title: "Identity verification needed", body: "The card service must verify your identity before it can issue your card. Open Cards to continue. Your money is back in your wallet." },
+    "with a verification link the customer is told to complete the identity verification (fixed, translated text)");
+});
+
+test("webhook card.failed with a reason but no link keeps the fixed message, unless the reason is about the identity verification", async () => {
+  const run = async (reason: string) => {
+    const f = fakeDb({ tables: { cards: activeCard({ status: "pending", creation_tx_id: "t-create" }), transactions: { id: "t-create", meta: {} } } });
+    await quiet(() => withFake(f, async () => { await L.handleCardEvent("card.failed", { id: "card_9", failure_reason: reason }); }));
+    return inserted(f, "notifications")[0];
+  };
+  assert.equal((await run("image illisible")).title, "Card creation failed");
+  const n = await run("Le titulaire doit d'abord compléter sa vérification d'identité.");
+  assert.equal(n.title, "Identity verification needed");
+  assert.match(n.body, /contact support/);
 });
 
 test("webhook card.failed without details behaves as before", async () => {

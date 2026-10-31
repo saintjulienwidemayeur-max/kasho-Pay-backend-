@@ -12,6 +12,7 @@ import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup
 import { cardCodeAttemptAllowed, resetCardCodeAttempts } from "./cardcode.js";
 import { MAX_SUBSCRIPTIONS_PER_USER, isAllowedPushEndpoint, pushConfigured, pushPublicKey, sendTestPush, validPushKeys, validTimeZone } from "./push.js";
 import { createSession, diditConfigured, getDecision, mapStatus } from "./didit.js";
+import { linkStillValid, mentionsIdentityVerification, pickVerification, safeHttpsUrl } from "./verification.js";
 
 export type { Ctx } from "./types.js";
 type Handler = import("./types.js").Handler;
@@ -53,6 +54,7 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
   const identity = await L.getFredaIdentity(c.userId);
   let id: string | undefined;
   let already = false;
+  let holderStatus = "enrolled"; // what Freda says about the holder: pending means it has not finished verifying the identity yet
   try {
     const res: any = await freda.createHolder({
       ...(identity ? { identity } : {}),
@@ -61,6 +63,8 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
       address: { street: d.street, city: d.city, state: d.state, postalCode: d.postalCode, country: d.country },
     });
     id = pickId(res); // `id` (mpc_...) is returned at the root; `already_existed: true` also returns the existing id
+    const st = String(res?.holder?.status ?? res?.profile?.status ?? "").toLowerCase();
+    if (st === "pending" || st === "enrolled") holderStatus = st;
   } catch (e) {
     if (!L.holderExists(e)) throw e;
     already = true;
@@ -82,13 +86,13 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
   if (id) {
     const { data: taken } = await L.db.from("card_holders").select("id, user_id").eq("freda_holder_id", id).eq("mode", mode).maybeSingle();
     if (taken && taken.user_id !== c.userId) throw new L.AppError("This card holder is already linked to another account.");
-    if (taken) return { holderId: taken.id as string, fredaId: id, linked: true, warning: null as string | null };
+    if (taken) return { holderId: taken.id as string, fredaId: id, linked: true, warning: null as string | null, status: holderStatus };
   }
 
   const { data: row, error } = await L.db.from("card_holders").insert({
     user_id: c.userId, freda_holder_id: id ?? null, mode, email: d.email, first_name: d.firstName, last_name: d.lastName,
     dob: d.dob, country: d.country, id_number: encryptField(d.idNumber), phone_code: d.phoneCode, phone_number: d.phone.replace(/\D/g, ""),
-    address_street: d.street, address_city: d.city, address_state: d.state, address_postal_code: d.postalCode, status: "enrolled", identity_sent: !!identity,
+    address_street: d.street, address_city: d.city, address_state: d.state, address_postal_code: d.postalCode, status: holderStatus, identity_sent: !!identity,
   }).select("id").single();
   if (error) throw error;
 
@@ -108,6 +112,7 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
     fredaId: id,
     linked: !!id,
     warning: id ? null : "Holder registered. Its ID will be read from the card service when you create the card.",
+    status: holderStatus,
   };
 }
 
@@ -518,17 +523,23 @@ export const handlers: Record<string, Handler> = {
       let holderFredaId: string | undefined;
       {
         const idNumber = decryptField(holder.id_number);
+        let holderPending = false; // the card service has not finished verifying this holder's identity
         if (holder.freda_holder_id) {
           try {
             const g: any = await freda.getHolder(holder.freda_holder_id);
             const h = g?.holder ?? g;
-            if (!h?.status || String(h.status).toLowerCase() === "enrolled") holderFredaId = holder.freda_holder_id;
-            else console.error("[holder] stored holder is not enrolled, status:", h.status);
+            const hs = String(h?.status ?? "").toLowerCase();
+            if (!hs || hs === "enrolled") holderFredaId = holder.freda_holder_id;
+            else if (hs === "pending") holderPending = true;
+            else console.error("[holder] stored holder is not enrolled, status:", h.status, "reason:", String(h?.failure_reason ?? "").slice(0, 200));
           } catch (e) {
             console.error("[holder] could not read stored holder:", (e as Error).message);
           }
         }
         if (!holderFredaId) holderFredaId = (await L.findExistingHolder(holder.email, idNumber)).id;
+        // Nothing is charged, and no second holder is created, for a holder that is still being verified: "Le titulaire doit d'abord
+        // compléter sa vérification d'identité".
+        if (!holderFredaId && holderPending) throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
         if (!holderFredaId) {
           const again = holderInput.safeParse({
             firstName: holder.first_name, lastName: holder.last_name, email: holder.email, dob: String(holder.dob).slice(0, 10),
@@ -537,6 +548,7 @@ export const handlers: Record<string, Handler> = {
           });
           if (!again.success) throw new L.AppError("Please complete your profile: phone number and full address.");
           const r = await registerHolder(again.data, c);
+          if (r.status === "pending") throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
           holderFredaId = r.fredaId ?? (await L.findExistingHolder(holder.email, idNumber)).id;
           if (r.holderId !== holder.id) {
             await L.db.from("card_holders").delete().eq("id", holder.id); // replaced by the new row
@@ -585,29 +597,67 @@ export const handlers: Record<string, Handler> = {
       }
       await L.db.from("transactions").update({ card_id: cardId }).eq("id", txId);
 
+      // Always send the exact holder_id of THIS user's enrolled holder (the account default may belong to another user).
+      const cardReq = { reference, kind: "individual" as const, brand: d.brand, amount, holder_id: holderFredaId };
+      let res: any;
       try {
-        // Always send the exact holder_id of THIS user's enrolled holder (the account default may belong to another user).
-        const cardReq = { reference, kind: "individual" as const, brand: d.brand, amount, holder_id: holderFredaId };
-        let res: any;
-        try {
-          res = await freda.createCard(cardReq);
-        } catch (e) {
-          if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);
-          throw e;
+        res = await freda.createCard(cardReq);
+      } catch (e) {
+        if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);
+        if (e instanceof FredaError && e.ambiguous) {
+          // Unknown outcome (timeout, 5xx): the card may well exist at Freda. It stays pending and the same request is replayed
+          // (same `reference`: never a second card) until Freda answers. The customer is NOT told to try again: that would charge twice.
+          await L.rememberCardProblem(txId, e);
+          console.error("[card] the outcome of POST /v1/cards is unknown, it will be retried:", reference);
+          return { cardId, transactionId: txId as string };
         }
-        await L.db.from("cards").update({ freda_card_id: res.id ?? null }).eq("id", cardId);
+        // Refused for good: the money goes back now, and Freda's reason is kept on the ledger row for support.
+        await L.rememberCardProblem(txId, e);
+        await L.failTx(txId, "Provider rejected the card");
+        await L.db.from("cards").update({ status: "failed" }).eq("id", cardId);
+        throw e;
+      }
+      // From here the card exists at Freda: nothing below may fail the transaction or give the money back. If recording it here
+      // goes wrong, the periodic sync finishes the job (it asks Freda again).
+      try {
+        const { error: idErr } = await L.db.from("cards").update({ freda_card_id: res?.id ?? null }).eq("id", cardId);
+        if (idErr) console.error("[card] could not save the Freda card id:", reference, idErr.message);
+        if (!res?.id) console.error("[card] POST /v1/cards answered without a card id:", reference, Object.keys(res ?? {}).join(","));
+        else console.log("[card] POST /v1/cards accepted:", reference, "->", res.id, "status", String(res.status ?? "?"), "fields:", Object.keys(res).join(","));
+        const ver = pickVerification(res);
+        if (ver.link || ver.reason) {
+          await L.trackPendingCard({ id: cardId, user_id: c.userId, creation_tx_id: txId, created_at: new Date().toISOString(), reference, freda_card_id: res?.id ?? null }, { fredaStatus: String(res?.status ?? "pending"), verification: ver });
+        }
         if (res?.status && L.normalizeCardStatus(res.status) !== "pending") {
           const { data: row } = await L.db.from("cards").select("*").eq("id", cardId).single();
           await L.applyCardStatus(row, res.status);
         }
       } catch (e) {
-        if (!(e instanceof FredaError && e.ambiguous)) {
-          await L.failTx(txId, "Provider rejected the card");
-          await L.db.from("cards").update({ status: "failed" }).eq("id", cardId);
-        }
-        throw e;
+        console.error("[card] created at Freda but not fully recorded yet, the sync will finish it:", reference, (e as Error).message);
       }
       return { cardId, transactionId: txId as string };
+    },
+  },
+
+  /**
+   * The identity verification the card service asks of the customer before it can issue a card (a link to open), if there is one that
+   * is still valid. `waiting` = a pending card whose reason says so but without a link (nothing to open: contact support).
+   */
+  cardVerificationFn: {
+    schema: z.object({}),
+    run: async (_d, c) => {
+      const { data } = await L.db.from("transactions").select("id, status, card_id, meta, created_at").eq("user_id", c.userId).eq("kind", "card_creation")
+        .gt("created_at", new Date(Date.now() - 7 * 24 * 3600_000).toISOString()).order("created_at", { ascending: false }).limit(5);
+      let waiting: { cardId: string | null } | null = null;
+      for (const t of data ?? []) {
+        if (t.status !== "pending" && t.status !== "failed") continue;
+        const link = safeHttpsUrl(t.meta?.verification_link);
+        if (link && linkStillValid(t.meta?.verification_link_expires_at)) {
+          return { state: "link" as const, link, expiresAt: typeof t.meta?.verification_link_expires_at === "string" ? (t.meta.verification_link_expires_at as string) : null, cardId: (t.card_id as string | null) ?? null, cardStatus: t.status as string };
+        }
+        if (!waiting && t.status === "pending" && mentionsIdentityVerification(t.meta?.card_failure_reason)) waiting = { cardId: (t.card_id as string | null) ?? null };
+      }
+      return waiting ? { state: "waiting" as const, link: null, expiresAt: null, cardId: waiting.cardId, cardStatus: "pending" } : { state: null, link: null, expiresAt: null, cardId: null, cardStatus: null };
     },
   },
 
