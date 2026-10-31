@@ -124,6 +124,43 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
   };
 }
 
+
+const lastReverify = new Map<string, number>();
+/**
+ * Freda only issues a card to a holder whose identity is verified by the card provider (verification.tier 2: GET /v1/cards/holders/:id
+ * says `verification.ready_for_cards`), even when the holder is `enrolled`. If it is not ready, the holder is sent again (same e-mail,
+ * POST /v1/cards/holders) with the ID document, front AND back, which restarts the verification; then it is checked for a while.
+ */
+async function ensureHolderReady(holder: any, holderFredaId: string, c: Ctx): Promise<void> {
+  const ready = async () => {
+    const g: any = await freda.getHolder(holderFredaId);
+    const h = g?.holder ?? g;
+    const v = h?.verification;
+    console.log("[holder] verification of", holderFredaId, "tier:", String(v?.tier ?? "?"), "ready_for_cards:", String(v?.ready_for_cards ?? "?"));
+    return !v || v.ready_for_cards !== false;
+  };
+  if (await ready()) return;
+  const last = lastReverify.get(holderFredaId) ?? 0;
+  if (Date.now() - last > 10 * 60_000) {
+    lastReverify.set(holderFredaId, Date.now());
+    // Read the ID photos again from Didit (the whole front and back, not a crop) instead of the copies kept earlier.
+    await L.db.from("profiles").update({ kyc_doc_path: null, kyc_doc_back_path: null }).eq("id", c.userId);
+    const identity = await L.getFredaIdentity(c.userId);
+    if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
+    await freda.createHolder({
+      firstName: holder.first_name, lastName: holder.last_name, email: holder.email, country: holder.country, dob: String(holder.dob).slice(0, 10),
+      identificationNumber: decryptField(holder.id_number), phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
+      address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
+      identity,
+    }).catch((e: unknown) => console.error("[holder] re-sending the holder failed:", (e as Error).message));
+  }
+  for (let i = 0; i < 6; i++) {
+    await new Promise((r) => setTimeout(r, 10_000));
+    if (await ready()) return;
+  }
+  throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
+}
+
 // Admin access (2FA, roles) lives in admin.ts; re-exported here for the tests that import it from this module.
 export { ADMIN_MFA_MESSAGE, adminMfaOk } from "./admin.js";
 
@@ -487,6 +524,7 @@ export const handlers: Record<string, Handler> = {
     }),
     run: async (d, c) => {
       const cfg = getConfig();
+      await L.refreshKycFromDidit(c.userId); // Didit's webhook may never come: ask for the decision now
       const profile = await loadProfile(c.userId);
       if (cfg.requireKycForCards && profile?.kyc_status !== "verified") {
         throw new L.AppError("Verify your identity before creating a card.");
@@ -625,6 +663,7 @@ export const handlers: Record<string, Handler> = {
 
 
       // Always send the exact holder_id of THIS user's enrolled holder (the account default may belong to another user).
+      await ensureHolderReady(holder, holderFredaId, c);
       await L.mergeTxMeta(await L.getTx(txId), { holder_id: holderFredaId });
       const cardReq = { reference, kind: "individual" as const, brand: d.brand, amount, holder_id: holderFredaId };
       let res: any;

@@ -68,7 +68,7 @@ export function toUserError(e: any): Error {
 
   if (e instanceof FredaError) {
     console.error("[freda]", e.endpoint, e.status, e.code, e.message); // endpoint/code/status/message only: never the body
-    if (e.code === "HOLDER_NOT_ENROLLED" || mentionsIdentityVerification(e.message)) return new AppError(IDENTITY_VERIFICATION_MESSAGE);
+    if (e.code === "HOLDER_NOT_ENROLLED" || e.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(e.message)) return new AppError(IDENTITY_VERIFICATION_MESSAGE);
     if (isPayerInsufficientFunds(e)) {
       return new AppError("The balance on your mobile money account is too low for this payment. Add funds and try again.");
     }
@@ -816,6 +816,22 @@ export function mapCardTransaction(t: any, i: number) {
 import { getDecision, mapStatus } from "./didit.js";
 import { decryptField, encryptField } from "./crypto.js";
 
+/**
+ * Didit does not always send its webhook, so the decision is asked for whenever it matters: if this user is not verified here yet but has a
+ * Didit session, read the decision now (the same step as syncKyc). Never throws: a Didit problem must not break the request it helps.
+ */
+export async function refreshKycFromDidit(userId: string): Promise<void> {
+  try {
+    const { data: prof } = await db.from("profiles").select("kyc_status").eq("id", userId).single();
+    if (prof?.kyc_status === "verified") return;
+    const { data: sub } = await db.from("kyc_submissions").select("didit_session_id").eq("user_id", userId)
+      .not("didit_session_id", "is", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
+    if (sub?.didit_session_id) await applyKycDecision(sub.didit_session_id, userId);
+  } catch (e) {
+    console.error("[kyc] could not read the Didit decision:", (e as Error).message);
+  }
+}
+
 /** Reads the Didit decision for a session and applies it to the user's profile. Returns the Kasho status. */
 export async function applyKycDecision(sessionId: string, userId: string): Promise<string> {
   const dec = await getDecision(sessionId);
@@ -899,9 +915,9 @@ export async function storeKycDocument(userId: string, idv: any): Promise<Record
   const out: Record<string, unknown> = {};
   if (!idv) return out;
   out["kyc_doc_type"] = mapDocType(idv.document_type);
-  const front = await storeIdImage(userId, idv.front_image ?? idv.full_front_image, "front");
+  const front = await storeIdImage(userId, idv.full_front_image ?? idv.front_image, "front"); // the whole photo, not a crop
   if (front) out["kyc_doc_path"] = front;
-  const backUrl = idv.back_image ?? idv.full_back_image;
+  const backUrl = idv.full_back_image ?? idv.back_image;
   if (!backUrl) out["kyc_doc_back_path"] = "";
   else {
     const back = await storeIdImage(userId, backUrl, "back");
