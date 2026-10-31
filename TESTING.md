@@ -35,7 +35,7 @@ Before starting: run every file in `supabase/migrations/` in order, set `.env` (
 - [ ] Switch to French: amounts show as `10,00 $`, no English left on the screens above, no console hydration error.
 - [ ] 360 px wide phone: no horizontal scroll on any screen.
 
-## 7. Admin site (kasho-pay-admin)
+## 7. Admin site (admin-page-kasho-pay)
 Needs migration `20261101000000_admin_panel.sql`, the admin site deployed, `ADMIN_ORIGINS` set on the backend (OPERATIONS.md, section 8), a super administrator account and a normal customer account (B) that has a balance.
 - [ ] Signing in to the admin site with customer account B is refused ("This account is not allowed to use the admin site") and nothing stays signed in. With the browser console: `fetch("<backend>/api/adminStatus", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer <B's token>" }, body: "{}" })` from the Kasho Pay app page is refused (`ADMIN_SITE`), and so is a call to `sendMoney` from the admin site.
 - [ ] A new administrator account asks to set up 2FA at the first sign-in (QR code, first code); after that every sign-in asks for the code, and a wrong code never opens the site. Closing the browser, or 20 minutes without activity, signs out.

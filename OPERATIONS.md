@@ -38,7 +38,7 @@ Authentication > Sign In / Providers > Email:
 - Run every new migration before deploying (latest: `20261101000000_admin_panel.sql`).
 
 ## 8. Admin site: the first super administrator
-The admin is a separate site (repo `kasho-pay-admin`, for example at `https://admin.kashopay.com`) that uses this backend and the same Supabase project.
+The admin is a separate site (repo `admin-page-kasho-pay`, for example at `https://admin.kashopay.com`) that uses this backend and the same Supabase project.
 1. Run `supabase/migrations/20261101000000_admin_panel.sql` in the Supabase SQL editor (after the earlier migrations). It adds `admins.role`, the append-only `admin_audit`, `app_settings`, `partner_costs` (Freda's prices), `card_events` and the admin SQL functions.
 2. Create the account: Supabase > Authentication > Users > Add user (tick "Auto Confirm User"; the sign-up trigger creates the profile and the wallet), then make it a super administrator in the SQL editor:
    ```sql

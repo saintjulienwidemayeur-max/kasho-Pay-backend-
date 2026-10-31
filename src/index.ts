@@ -22,7 +22,7 @@ const hops = Number(process.env["TRUST_PROXY"] ?? 0);
 app.set("trust proxy", Number.isInteger(hops) && hops > 0 ? hops : false);
 
 const csv = (v: string | undefined) => (v ?? "").split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
-// The admin tools are a separate site (kasho-pay-admin): its origin(s) go in ADMIN_ORIGINS and are allowed by CORS automatically.
+// The admin tools are a separate site (admin-page-kasho-pay): its origin(s) go in ADMIN_ORIGINS and are allowed by CORS automatically.
 const adminOrigins = csv(process.env["ADMIN_ORIGINS"]);
 const origins = [...new Set([...csv(process.env["CORS_ORIGIN"] ?? "http://localhost:5173,http://127.0.0.1:5173"), ...adminOrigins])];
 const adminSiteGuard = makeAdminSiteGuard(adminOrigins, production);
