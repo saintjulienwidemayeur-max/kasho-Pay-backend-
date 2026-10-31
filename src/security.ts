@@ -78,6 +78,12 @@ export function noStore(_req: any, res: any, next: any) {
 }
 
 // ------------------------------------------------------------ misc
+/** True while a Supabase user is banned (the admin panel suspends a customer with ban_duration). */
+export function isSuspended(user: { banned_until?: string | null } | null | undefined): boolean {
+  const until = user?.banned_until ? Date.parse(user.banned_until) : NaN;
+  return Number.isFinite(until) && until > Date.now();
+}
+
 export function bearerToken(header: string | undefined | null): string | null {
   const m = /^Bearer ([A-Za-z0-9._~+\/=-]{10,4096})$/.exec(header ?? "");
   return m ? m[1]! : null;
@@ -91,6 +97,30 @@ export function isJsonRequest(contentType: string | undefined | null): boolean {
 export function makeOriginCheck(allowed: string[], allowLan: boolean) {
   const lan = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d+)?$/;
   return (origin: string | undefined): boolean => !origin || allowed.includes(origin) || (allowLan && lan.test(origin));
+}
+
+// ------------------------------------------------------------ admin site isolation
+/** Endpoints the admin site may call besides the admin tools: the administrator changes his own password there. */
+const ADMIN_SITE_EXTRA = new Set(["changePassword"]);
+
+/**
+ * The admin tools live on their own site, apart from the Kasho Pay app. `adminOrigins` (ADMIN_ORIGINS) lists that
+ * site's origins. Returns null when the request may go on, otherwise the message to answer with:
+ *  - an "admin..." endpoint answers only to a request whose Origin is in the list (a script without Origin is refused too),
+ *    so a session stolen through the customer app cannot be used on the admin tools;
+ *  - a request from the admin site reaches only the admin tools and changePassword;
+ *  - with an empty list the tools are open in development and switched off in production (fail closed).
+ */
+export function makeAdminSiteGuard(adminOrigins: string[], production: boolean) {
+  return (name: string | undefined, origin: string | undefined): string | null => {
+    const fromAdminSite = !!origin && adminOrigins.includes(origin);
+    if (name?.startsWith("admin")) {
+      if (adminOrigins.length === 0) return production ? "The admin site is not set up on the server yet (ADMIN_ORIGINS)." : null;
+      return fromAdminSite ? null : "The admin tools only work on the Kasho Pay admin site.";
+    }
+    if (fromAdminSite && !(name && ADMIN_SITE_EXTRA.has(name))) return "This action is not available from the admin site.";
+    return null;
+  };
 }
 
 // ------------------------------------------------------------ outbound fetch guard (SSRF)

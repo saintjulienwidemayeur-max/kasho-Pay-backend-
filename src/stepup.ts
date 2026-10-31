@@ -14,6 +14,11 @@ export const STEP_UP: Record<string, { field: string; strip: boolean }> = {
   // Changing fees moves money for every user: re-check the admin's password.
   adminSaveFee: { field: "confirmPassword", strip: true },
   adminDeleteFee: { field: "confirmPassword", strip: true },
+  // Moving customer money, suspending customers and changing what Freda charges us: password again, every time.
+  adminAdjustBalance: { field: "confirmPassword", strip: true },
+  adminSetUserBlocked: { field: "confirmPassword", strip: true },
+  adminSavePartnerCost: { field: "confirmPassword", strip: true },
+  adminApplyPartnerPlan: { field: "confirmPassword", strip: true },
 };
 
 /**
@@ -26,6 +31,9 @@ export const MFA_ENDPOINTS: ReadonlySet<string> = new Set([
   "sendMoney", "startDeposit", "startWithdrawal", "createCardFn", "createHolderFn", "fundCardFn", "withdrawCardFn",
   "terminateCardFn", "freezeCardFn", "removeCardFn", "updateCardFn", "setCardCode", "revealCardFn", "getIdentity",
   "changePassword", "changeEmail", "createKycSession", "adminListFees", "adminSaveFee", "adminDeleteFee",
+  // admin panel (adminStatus is not here on purpose: the page uses it to explain what is missing before 2FA is set up)
+  "adminOverview", "adminFredaFunds", "adminPartnerCosts", "adminSavePartnerCost", "adminApplyPartnerPlan", "adminListUsers", "adminGetUser",
+  "adminAdjustBalance", "adminSetUserBlocked", "adminListTransactions", "adminListSupport", "adminListAudit",
 ]);
 
 /** Defaults to TRUE: only an explicit "false" turns the wide enforcement off. */

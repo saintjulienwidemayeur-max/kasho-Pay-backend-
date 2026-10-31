@@ -35,4 +35,17 @@ Before starting: run every file in `supabase/migrations/` in order, set `.env` (
 - [ ] Switch to French: amounts show as `10,00 $`, no English left on the screens above, no console hydration error.
 - [ ] 360 px wide phone: no horizontal scroll on any screen.
 
+## 7. Admin site (admin-page-kasho-pay)
+Needs migration `20261101000000_admin_panel.sql`, the admin site deployed, `ADMIN_ORIGINS` set on the backend (OPERATIONS.md, section 8), a super administrator account and a normal customer account (B) that has a balance.
+- [ ] Signing in to the admin site with customer account B is refused ("This account is not allowed to use the admin site") and nothing stays signed in. With the browser console: `fetch("<backend>/api/adminStatus", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer <B's token>" }, body: "{}" })` from the Kasho Pay app page is refused (`ADMIN_SITE`), and so is a call to `sendMoney` from the admin site.
+- [ ] A new administrator account asks to set up 2FA at the first sign-in (QR code, first code); after that every sign-in asks for the code, and a wrong code never opens the site. Closing the browser, or 20 minutes without activity, signs out.
+- [ ] Overview: the Master Wallet and Gateway cards match the Freda dashboard ("Update" reads them again). With a wrong API key the page says Freda could not be reached and the rest still loads.
+- [ ] Make a deposit, a withdrawal, a card top-up and a card withdrawal in the sandbox, then check Profit and loss: our fees = the fees charged; Freda's share is marked "est." until the real fee is recorded (deposit `meta.fee_htg`, withdrawal `meta.payout_fee_htg`, card `meta.provider_fee_usd`).
+- [ ] Fees tab: the margin analysis is red where our fee is below Freda's cost. Changing a customer fee asks for the password and applies to the next operation. "Use these plans" refills Freda's price list.
+- [ ] Customers: find B by name, e-mail, @username or Kasho ID. Add $5 with a reason: B's balance goes up by $5, B gets the "Balance adjusted" notification and an "Added by Kasho Pay" line in the history. Remove $5: same, going down. Removing more than B's balance is refused, and so is adjusting your own account or another administrator's.
+- [ ] A wrong password at the confirmation prompt changes nothing. An administrator with `role = 'admin'` does not get the add / remove / suspend buttons (and the API refuses the calls).
+- [ ] Suspend B: B's open app stops working at once ("This account is suspended") and B cannot sign in again; Reactivate restores both. B's money is untouched.
+- [ ] Audit log: each action above is listed with the administrator, the customer and the IP. With the service role, `update` and `delete` on `admin_audit` must fail.
+- [ ] My account: change the password (the current one is asked), then sign in with the new one.
+
 Report anything that fails with the screen, the exact steps and the browser console / backend log lines.

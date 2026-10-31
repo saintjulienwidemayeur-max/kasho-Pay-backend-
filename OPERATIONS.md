@@ -34,5 +34,23 @@ Authentication > Sign In / Providers > Email:
 - Webhook: a test-key webhook is not a live one. Run `npm run webhook:register -- https://<backend>` with the live key and put the new `whsec_...` in `FREDA_WEBHOOK_SECRET`. Events used: `payment.*`, `payout.*`, `card.created`, `card.failed`, `card.frozen`, `card.unfrozen`, `card.terminated`, `card.balance_updated`, `card.transaction`.
 - Master Wallet (cards): deposit real USD in the Freda dashboard. 50 USD of it stays locked as the guarantee, only the rest (`spendable`) pays card creations ($10 + prefund) and top-ups. In Live only a real deposit credits it. The backend prints the figures at startup and logs `[master-wallet] LOW` (alert threshold `MASTER_WALLET_ALERT_USD`): watch for that line.
 - Gateway balance (HTG) funds withdrawals to MonCash / NatCash: Freda sends them one at a time, about 2 minutes apart, so several withdrawals take a while to arrive.
-- Fees: Freda charges 5 % on payouts and $0.50 when a card is closed; make sure the fee schedule (`fee_rules`) covers your costs.
-- Run every new migration before deploying (latest: `20261031000000_kyc_doc_back.sql`).
+- Fees: Freda charges 5 % on payouts and $0.50 when a card is closed; make sure the fee schedule (`fee_rules`) covers your costs. The admin page (Fees tab) compares what you charge with what Freda charges, operation by operation.
+- Run every new migration before deploying (latest: `20261101000000_admin_panel.sql`).
+
+## 8. Admin site: the first super administrator
+The admin is a separate site (repo `admin-page-kasho-pay`, for example at `https://admin.kashopay.com`) that uses this backend and the same Supabase project.
+1. Run `supabase/migrations/20261101000000_admin_panel.sql` in the Supabase SQL editor (after the earlier migrations). It adds `admins.role`, the append-only `admin_audit`, `app_settings`, `partner_costs` (Freda's prices), `card_events` and the admin SQL functions.
+2. Create the account: Supabase > Authentication > Users > Add user (tick "Auto Confirm User"; the sign-up trigger creates the profile and the wallet), then make it a super administrator in the SQL editor:
+   ```sql
+   insert into public.admins (user_id, role)
+   select id, 'super' from auth.users where lower(email) = lower('admin@your-domain.example')
+   on conflict (user_id) do update set role = 'super';
+   ```
+   Use a long password that exists nowhere else: this account can add and remove customer money. Do not keep scripts that contain the password in the repository.
+3. Deploy the admin site (see its README: Cloudflare, build variables `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, `VITE_API_URL`) on its own domain.
+4. On Render set `ADMIN_ORIGINS` to that origin (for example `https://admin.kashopay.com`, no trailing slash) and redeploy. Without it the admin tools are off in production. CORS needs nothing more: `ADMIN_ORIGINS` is allowed automatically.
+5. Open the admin site and sign in with the account of step 2. The first time it asks you to set up 2FA (scan the QR code with an authenticator app, enter the first code); after that every sign-in asks for the code. Do this right away: until 2FA is on, the password alone is enough to reach that screen.
+6. Change the password in My account (it asks for the current password and signs the other devices out). Add other administrators the same way with `role = 'admin'` (read access and the customer fee schedule) or `'super'`; remove one with `delete from public.admins where user_id = '...'`.
+7. Fees tab: choose the Freda Gateway and Issuing plans you really have and press "Use these plans" (Freda's public prices; edit any line that differs in your contract). The Overview shows the real Master Wallet and Gateway balances once `FREDA_API_KEY` is set (a live key shows live balances).
+8. Everything done on the site is in `admin_audit` (Audit log tab). Adding or removing money there changes the Kasho Pay wallet only; it does not move money at Freda, so keep Freda funded for what customers hold.
+9. Optional: `ADMIN_MAX_ADJUST_USD` (default 10000) caps one add / remove money adjustment. The admin site signs out after 20 minutes without activity and when the browser is closed.

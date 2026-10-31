@@ -141,12 +141,28 @@ export function readClosure(o: any): { refunded: number; fee: number } | null {
   return refunded === null || fee === null ? null : { refunded, fee };
 }
 
+export type MasterWallet = {
+  balance: number; guarantee: number; spendable: number; low: boolean;
+  /** Money already placed on active cards, and how many cards that is. */
+  reservedOnCards: number; activeCards: number; mode: "live" | "sandbox" | null;
+};
+
 /** Master Wallet figures from GET /v1/master-wallet (the guarantee deposit is always locked: only `spendable` can be used). */
-export function readMasterWallet(o: any): { balance: number; guarantee: number; spendable: number; low: boolean } | null {
+export function readMasterWallet(o: any): MasterWallet | null {
   const balance = usdOrNull(o?.balance);
   const spendable = usdOrNull(o?.spendable_usd);
   if (balance === null || spendable === null) return null;
-  return { balance, guarantee: usdOrNull(o?.guarantee_usd) ?? 0, spendable, low: o?.low_balance === true };
+  const cards = Number(o?.active_cards);
+  return {
+    balance, guarantee: usdOrNull(o?.guarantee_usd) ?? 0, spendable, low: o?.low_balance === true,
+    reservedOnCards: usdOrNull(o?.reserved_on_cards_usd) ?? 0, activeCards: Number.isFinite(cards) && cards >= 0 ? Math.floor(cards) : 0,
+    mode: o?.mode === "live" ? "live" : o?.mode === "sandbox" ? "sandbox" : null,
+  };
+}
+
+/** GET /v1/balance: Gateway HTG (MonCash / NatCash receipts), Gateway USD (card payments) and the Master Wallet (cards). */
+export function readFredaBalances(o: any): { gatewayHtg: number | null; gatewayUsd: number | null; masterWallet: number | null } {
+  return { gatewayHtg: usdOrNull(o?.gateway?.available), gatewayUsd: usdOrNull(o?.gateway_usd?.available), masterWallet: usdOrNull(o?.master_wallet?.available) };
 }
 
 /** X-Freda-Signature: sha256=<hex HMAC-SHA256 of the RAW body with the whsec_ secret> */

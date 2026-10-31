@@ -6,11 +6,12 @@ import { supabaseAdmin } from "./supabase.js";
 import * as L from "./ledger.js";
 import { freda, fredaConfigured, fredaMode, readMasterWallet, verifyWebhookSignature } from "./freda.js";
 import { getConfig } from "./config.js";
+import { isSuspended } from "./security.js";
 import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { initPush, runMorningGreetings } from "./push.js";
-import { bearerToken, createRateLimiter, getHandler, isJsonRequest, makeOriginCheck, noStore, securityHeaders } from "./security.js";
+import { bearerToken, createRateLimiter, getHandler, isJsonRequest, makeAdminSiteGuard, makeOriginCheck, noStore, securityHeaders } from "./security.js";
 
 const production = process.env["NODE_ENV"] === "production";
 const app = express();
@@ -20,8 +21,11 @@ app.disable("x-powered-by");
 const hops = Number(process.env["TRUST_PROXY"] ?? 0);
 app.set("trust proxy", Number.isInteger(hops) && hops > 0 ? hops : false);
 
-const origins = (process.env["CORS_ORIGIN"] ?? "http://localhost:5173,http://127.0.0.1:5173")
-  .split(",").map((s) => s.trim()).filter(Boolean);
+const csv = (v: string | undefined) => (v ?? "").split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
+// The admin tools are a separate site (admin-page-kasho-pay): its origin(s) go in ADMIN_ORIGINS and are allowed by CORS automatically.
+const adminOrigins = csv(process.env["ADMIN_ORIGINS"]);
+const origins = [...new Set([...csv(process.env["CORS_ORIGIN"] ?? "http://localhost:5173,http://127.0.0.1:5173"), ...adminOrigins])];
+const adminSiteGuard = makeAdminSiteGuard(adminOrigins, production);
 // localhost / private-network origins (phone on the same Wi-Fi) are for testing only.
 const allowLan = !production && (process.env["ALLOW_LAN_ORIGINS"] ?? "true").toLowerCase() !== "false";
 const originOk = makeOriginCheck(origins, allowLan);
@@ -152,6 +156,12 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   sendTestPush: { windowMs: MIN, max: 3 },
   adminSaveFee: { windowMs: MIN, max: 20 },
   adminDeleteFee: { windowMs: MIN, max: 20 },
+  adminAdjustBalance: { windowMs: MIN, max: 10 },
+  adminSetUserBlocked: { windowMs: MIN, max: 10 },
+  adminSavePartnerCost: { windowMs: MIN, max: 20 },
+  adminApplyPartnerPlan: { windowMs: MIN, max: 5 },
+  adminOverview: { windowMs: MIN, max: 30 },
+  adminFredaFunds: { windowMs: MIN, max: 20 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();
 for (const [name, l] of Object.entries(endpointLimits)) {
@@ -169,6 +179,8 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
     if (error || !data.user) return res.status(401).json({ error: { message: "Your session expired. Please log in again." } });
     // Money endpoints are only for users who confirmed their email.
     if (!data.user.email_confirmed_at) return res.status(403).json({ error: { message: "Please verify your email first." } });
+    // A suspended customer (admin panel) is refused at once, even with an access token that has not expired yet.
+    if (isSuspended(data.user)) return res.status(403).json({ error: { message: "This account is suspended. Contact support.", code: "ACCOUNT_SUSPENDED" } });
     req.mfaRequired = hasVerifiedTotp(data.user);
     req.aal = tokenAal(token);
     req.ctx = {
@@ -221,6 +233,8 @@ async function stepUp(req: AuthedRequest, res: Response, next: NextFunction) {
 app.use("/api", noStore);
 app.post("/api/:name", (req: Request, res: Response, next: NextFunction) => {
   if (!isJsonRequest(req.header("content-type"))) return res.status(415).json({ error: { message: "Content-Type must be application/json." } });
+  const refused = adminSiteGuard(req.params["name"], req.header("origin"));
+  if (refused) return res.status(403).json({ error: { message: refused, code: "ADMIN_SITE" } });
   return next();
 }, express.json({ limit: "100kb", strict: true }), requireAuth, generalUserLimit,
 (req: AuthedRequest, res: Response, next: NextFunction) => {
@@ -341,6 +355,7 @@ const port = Number(process.env["PORT"] ?? 4000);
 app.listen(port, () => {
   console.log(`Kasho Pay backend running on http://localhost:${port}`);
   console.log(`  CORS origins : ${origins.join(", ")}`);
+  console.log(`  Admin site   : ${adminOrigins.length ? adminOrigins.join(", ") : production ? "NOT SET, the admin tools are off (set ADMIN_ORIGINS)" : "not restricted (development)"}`);
   console.log(`  Freda        : ${fredaConfigured() ? fredaMode() : "NOT CONFIGURED (set FREDA_API_KEY)"}`);
   console.log(`  Environment  : ${production ? "production" : "development"}${allowLan ? " (LAN origins allowed)" : ""}`);
   const wh = process.env["FREDA_WEBHOOK_SECRET"] ?? "";
@@ -348,6 +363,7 @@ app.listen(port, () => {
   if (production) {
     if (fredaConfigured() && fredaMode() === "sandbox") console.warn("  WARNING: production server is using a sandbox Freda key.");
     if (origins.some((o) => /localhost|127\.0\.0\.1/.test(o))) console.warn("  WARNING: CORS_ORIGIN still lists localhost.");
+    if (!adminOrigins.length) console.warn("  WARNING: ADMIN_ORIGINS is empty, so the admin tools refuse every request. Set it to the admin site origin.");
     if (!hops) console.warn("  WARNING: TRUST_PROXY=0. Behind a reverse proxy set it to the number of proxies so rate limits see real IPs.");
   }
   console.log(`  Webhook URL  : POST /api/webhooks/freda`);
