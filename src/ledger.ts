@@ -68,7 +68,7 @@ export function toUserError(e: any): Error {
 
   if (e instanceof FredaError) {
     console.error("[freda]", e.endpoint, e.status, e.code, e.message); // endpoint/code/status/message only: never the body
-    if (e.code === "HOLDER_NOT_ENROLLED" || mentionsIdentityVerification(e.message)) return new AppError(IDENTITY_VERIFICATION_MESSAGE);
+    if (e.code === "HOLDER_NOT_ENROLLED" || e.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(e.message)) return new AppError(IDENTITY_VERIFICATION_MESSAGE);
     if (isPayerInsufficientFunds(e)) {
       return new AppError("The balance on your mobile money account is too low for this payment. Add funds and try again.");
     }
@@ -899,9 +899,9 @@ export async function storeKycDocument(userId: string, idv: any): Promise<Record
   const out: Record<string, unknown> = {};
   if (!idv) return out;
   out["kyc_doc_type"] = mapDocType(idv.document_type);
-  const front = await storeIdImage(userId, idv.front_image ?? idv.full_front_image, "front");
+  const front = await storeIdImage(userId, idv.full_front_image ?? idv.front_image, "front"); // the whole photo, not a crop
   if (front) out["kyc_doc_path"] = front;
-  const backUrl = idv.back_image ?? idv.full_back_image;
+  const backUrl = idv.full_back_image ?? idv.back_image;
   if (!backUrl) out["kyc_doc_back_path"] = "";
   else {
     const back = await storeIdImage(userId, backUrl, "back");
