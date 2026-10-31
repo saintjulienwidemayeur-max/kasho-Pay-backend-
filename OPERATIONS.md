@@ -39,7 +39,7 @@ Authentication > Sign In / Providers > Email:
 
 ## 8. Admin site: the first super administrator
 The admin is a separate site (repo `admin-page-kasho-pay`, for example at `https://admin.kashopay.com`) that uses this backend and the same Supabase project.
-1. Run `supabase/migrations/20261101000000_admin_panel.sql` in the Supabase SQL editor (after the earlier migrations). It adds `admins.role`, the append-only `admin_audit`, `app_settings`, `partner_costs` (Freda's prices), `card_events` and the admin SQL functions.
+1. Run `supabase/migrations/20261101000000_admin_panel.sql` in the Supabase SQL editor (after the earlier migrations). It adds `admins.role`, the append-only `admin_audit`, `card_events` (card purchases reported by Freda) and the admin SQL functions (`app_settings` and `partner_costs` are created too but no longer used).
 2. Create the account: Supabase > Authentication > Users > Add user (tick "Auto Confirm User"; the sign-up trigger creates the profile and the wallet), then make it a super administrator in the SQL editor:
    ```sql
    insert into public.admins (user_id, role)
@@ -51,6 +51,6 @@ The admin is a separate site (repo `admin-page-kasho-pay`, for example at `https
 4. On Render set `ADMIN_ORIGINS` to that origin (for example `https://admin.kashopay.com`, no trailing slash) and redeploy. Without it the admin tools are off in production. CORS needs nothing more: `ADMIN_ORIGINS` is allowed automatically.
 5. Open the admin site and sign in with the account of step 2. The first time it asks you to set up 2FA (scan the QR code with an authenticator app, enter the first code); after that every sign-in asks for the code. Do this right away: until 2FA is on, the password alone is enough to reach that screen.
 6. Change the password in My account (it asks for the current password and signs the other devices out). Add other administrators the same way with `role = 'admin'` (read access and the customer fee schedule) or `'super'`; remove one with `delete from public.admins where user_id = '...'`.
-7. Fees tab: choose the Freda Gateway and Issuing plans you really have and press "Use these plans" (Freda's public prices; edit any line that differs in your contract). The Overview shows the real Master Wallet and Gateway balances once `FREDA_API_KEY` is set (a live key shows live balances).
+7. The Overview shows the real Master Wallet and Gateway balances once `FREDA_API_KEY` is set (a live key shows live balances). The Fees tab edits what customers pay; the Cards tab lists every card issued.
 8. Everything done on the site is in `admin_audit` (Audit log tab). Adding or removing money there changes the Kasho Pay wallet only; it does not move money at Freda, so keep Freda funded for what customers hold.
 9. Optional: `ADMIN_MAX_ADJUST_USD` (default 10000) caps one add / remove money adjustment. The admin site signs out after 20 minutes without activity and when the browser is closed.

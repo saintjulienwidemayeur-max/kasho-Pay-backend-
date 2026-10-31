@@ -1,15 +1,13 @@
 // Admin panel API. Every endpoint needs: an entry in the `admins` table, a verified 2FA factor and an aal2 session.
-// Moving customer money, suspending customers and changing Freda's price list need the 'super' role and re-check the
-// password (see STEP_UP in stepup.ts). Money adjustments and suspensions are written to the append-only admin_audit log.
+// Moving customer money and suspending customers need the 'super' role and re-check the password (see STEP_UP in
+// stepup.ts). Money adjustments and suspensions are written to the append-only admin_audit log.
+// There is no profit calculation here on purpose: what the partner really charged is recorded per operation (see ledger.ts),
+// and a profit figure will only be shown once the rules for it are agreed.
 import { z } from "zod";
 import * as L from "./ledger.js";
 import { freda, fredaConfigured, fredaMode, readFredaBalances, readMasterWallet, type MasterWallet } from "./freda.js";
 import { getConfig, round2 } from "./config.js";
 import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
-import {
-  GATEWAY_PLANS, ISSUING_PLANS, PARTNER_OPERATIONS, buildPnl, feeAnalysis, isGatewayPlan, isIssuingPlan, monthlyPlanUsd, presetRules,
-  rowToPartnerRule, type GatewayPlan, type IssuingPlan, type PartnerRule,
-} from "./finance.js";
 import type { Ctx, Handler } from "./types.js";
 
 export const ADMIN_MFA_MESSAGE = "Turn on two-factor authentication to use the admin tools.";
@@ -23,7 +21,7 @@ export function adminMfaOk(c: Pick<Ctx, "mfa" | "aal">): boolean {
 
 /**
  * Only users listed in the `admins` table (server-only) get in, and only with 2FA. `need: "super"` is for the actions
- * that move customer money or change Freda's price list. A row without a role (before the migration) is a plain admin.
+ * that move customer money. A row without a role (before the migration) is a plain admin.
  */
 export async function requireAdmin(c: Ctx, need: AdminRole = "admin"): Promise<AdminRole> {
   if (!adminMfaOk(c)) throw new L.AppError(ADMIN_MFA_MESSAGE);
@@ -90,23 +88,6 @@ export async function fredaSnapshot(): Promise<FredaSnapshot> {
   return value;
 }
 
-// ------------------------------------------------------------------ partner price list and plans
-async function loadPlans(): Promise<{ gateway: GatewayPlan; issuing: IssuingPlan }> {
-  const rows = (await q<any[]>(L.db.from("app_settings").select("key, value").in("key", ["partner_gateway_plan", "partner_issuing_plan"]))) ?? [];
-  const get = (k: string) => rows.find((r) => r.key === k)?.value;
-  return {
-    gateway: isGatewayPlan(get("partner_gateway_plan")) ? get("partner_gateway_plan") : "standard",
-    issuing: isIssuingPlan(get("partner_issuing_plan")) ? get("partner_issuing_plan") : "startup",
-  };
-}
-
-async function loadPartnerRules(plans: { gateway: GatewayPlan; issuing: IssuingPlan }): Promise<PartnerRule[]> {
-  const rows = (await q<any[]>(L.db.from("partner_costs").select("*"))) ?? [];
-  if (!rows.length) return presetRules(plans.gateway, plans.issuing); // never leave the report without prices
-  const byOp = new Map(rows.map((r) => [r.operation, rowToPartnerRule(r)] as const));
-  return PARTNER_OPERATIONS.map((op) => byOp.get(op)).filter((r): r is PartnerRule => !!r);
-}
-
 // ------------------------------------------------------------------ reading many rows
 /** Reads a query page by page (the API returns at most 1000 rows per call), up to `cap` rows. */
 async function fetchPaged<T>(make: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: any }>, cap = 50_000) {
@@ -136,6 +117,7 @@ async function namesFor(ids: string[]): Promise<Map<string, { name: string; kash
 }
 
 const uuid = z.string().uuid();
+const CARD_STATUSES = ["pending", "active", "disabled", "failed", "terminated"] as const;
 const feeRuleInput = z.object({
   id: uuid.optional(),
   operation: z.enum(FEE_OPERATIONS),
@@ -165,7 +147,7 @@ export const adminHandlers: Record<string, Handler> = {
     },
   },
 
-  // ---------------------------------------------------------------- overview: Freda funds, customers, profit
+  // ---------------------------------------------------------------- overview: Freda funds and customers
   adminOverview: {
     schema: z.object({ days: z.number().int().min(1).max(366).default(30) }),
     run: async (d, c) => {
@@ -173,21 +155,10 @@ export const adminHandlers: Record<string, Handler> = {
       const to = new Date();
       const from = new Date(to.getTime() - d.days * 86_400_000);
       const cfg = getConfig();
-      const plans = await loadPlans();
-      const [stats, tx, purchases, rules, snapshot] = await Promise.all([
+      const [stats, snapshot] = await Promise.all([
         q<any>(L.db.rpc("kasho_admin_stats", { p_from: from.toISOString(), p_to: to.toISOString() })),
-        fetchPaged<any>((a, b) => L.db.from("transactions").select("id, kind, status, amount, fee, created_at, meta")
-          .eq("status", "completed").in("kind", ["deposit", "withdrawal", "card_creation", "card_fund", "card_withdraw", "transfer_out"])
-          .gte("created_at", from.toISOString()).lt("created_at", to.toISOString()).order("created_at").order("id").range(a, b)),
-        fetchPaged<any>((a, b) => L.db.from("card_events").select("id, type, created_at")
-          .gte("created_at", from.toISOString()).lt("created_at", to.toISOString()).order("created_at").order("id").range(a, b)),
-        loadPartnerRules(plans),
         fredaSnapshot(),
       ]);
-      const buys = purchases.rows.filter((p) => !/^(CREDIT|REFUND|REVERSAL|DECLINE|DECLINED)$/i.test(String(p.type ?? "")));
-      const pnl = buildPnl({
-        rows: tx.rows, rules, htgPerUsd: cfg.htgPerUsd, purchases: buys, monthlyPlanUsd: monthlyPlanUsd(plans.gateway, plans.issuing, cfg.htgPerUsd), days: d.days,
-      });
 
       // Money owed to customers against money held at Freda (indicative: the HTG balance is converted at our fixed rate).
       const owed = Number(stats?.wallets_total ?? 0);
@@ -203,12 +174,9 @@ export const adminHandlers: Record<string, Handler> = {
           cardsTotal: Number(stats?.cards_total ?? 0), cardsActive: Number(stats?.cards_active ?? 0), cardsBalance: Number(stats?.cards_balance ?? 0),
           txPending: Number(stats?.tx_pending ?? 0), txPendingOld: Number(stats?.tx_pending_old ?? 0), txFailed: Number(stats?.tx_failed ?? 0),
           adjustCredits: Number(stats?.adjust_credits ?? 0), adjustDebits: Number(stats?.adjust_debits ?? 0),
-          cardPurchases: Number(stats?.card_purchases ?? 0), cardEventsSince: (stats?.card_events_since as string | null) ?? null,
+          cardPurchases: Number(stats?.card_purchases ?? 0),
         },
-        pnl,
         funds: { owedToUsers: owed, heldAtFreda: held, coverage: held !== null && owed > 0 ? Math.round((held / owed) * 1000) / 1000 : null, rate: cfg.htgPerUsd },
-        plans,
-        truncated: tx.truncated || purchases.truncated,
       };
     },
   },
@@ -270,67 +238,6 @@ export const adminHandlers: Record<string, Handler> = {
       if (!data?.length) throw new L.AppError("Fee rule not found.");
       await L.db.from("activity_log").insert({ user_id: c.userId, event: "Fee rule deleted", detail: String(data[0].operation), ip: c.ip, user_agent: c.ua });
       await audit(c, "fee_rule_deleted", { operation: String(data[0].operation) });
-      return { ok: true };
-    },
-  },
-
-  // ---------------------------------------------------------------- what Freda charges us, and the margin per operation
-  adminPartnerCosts: {
-    schema: z.object({}).passthrough(),
-    run: async (_d, c) => {
-      await requireAdmin(c);
-      const cfg = getConfig();
-      const plans = await loadPlans();
-      const [rules, ourRules] = await Promise.all([loadPartnerRules(plans), L.feeRules()]);
-      return {
-        plans, options: { gateway: GATEWAY_PLANS, issuing: ISSUING_PLANS }, rules, rate: cfg.htgPerUsd,
-        monthlyPlanUsd: monthlyPlanUsd(plans.gateway, plans.issuing, cfg.htgPerUsd),
-        analysis: feeAnalysis(ourRules, rules, cfg.htgPerUsd),
-      };
-    },
-  },
-
-  adminSavePartnerCost: {
-    schema: z.object({
-      operation: z.enum(PARTNER_OPERATIONS),
-      percent: z.number().min(0).max(100),
-      flatUsd: z.number().min(0).max(1000),
-      flatHtg: z.number().min(0).max(1_000_000),
-      thresholdUsd: z.number().min(0).max(1_000_000).nullable().default(null),
-      active: z.boolean().default(true),
-      note: z.string().trim().max(120).default(""),
-      confirmPassword: z.string().optional(),
-    }),
-    run: async (d, c) => {
-      await requireAdmin(c, "super");
-      const row = {
-        operation: d.operation, percent: Math.round(d.percent * 10000) / 10000, flat_usd: Math.round(d.flatUsd * 10000) / 10000,
-        flat_htg: round2(d.flatHtg), threshold_usd: d.thresholdUsd === null ? null : round2(d.thresholdUsd), active: d.active, note: d.note, updated_by: c.userId,
-      };
-      // keep the label that is already stored (the form does not edit it)
-      const existing = await q<any>(L.db.from("partner_costs").select("label").eq("operation", d.operation).maybeSingle());
-      const label = existing?.label || presetRules("standard", "startup").find((r) => r.operation === d.operation)?.label || d.operation;
-      await q(L.db.from("partner_costs").upsert({ ...row, label }, { onConflict: "operation" }));
-      await audit(c, "partner_cost_saved", { operation: d.operation, percent: row.percent, flatUsd: row.flat_usd, flatHtg: row.flat_htg, thresholdUsd: row.threshold_usd, active: row.active });
-      return { ok: true };
-    },
-  },
-
-  /** Replaces the partner price list with Freda's public prices for the chosen plans. */
-  adminApplyPartnerPlan: {
-    schema: z.object({ gateway: z.enum(GATEWAY_PLANS), issuing: z.enum(ISSUING_PLANS), confirmPassword: z.string().optional() }),
-    run: async (d, c) => {
-      await requireAdmin(c, "super");
-      const rules = presetRules(d.gateway, d.issuing);
-      await q(L.db.from("partner_costs").upsert(rules.map((r) => ({
-        operation: r.operation, label: r.label, percent: r.percent, flat_usd: r.flatUsd, flat_htg: r.flatHtg, threshold_usd: r.thresholdUsd,
-        active: r.active, note: r.note, updated_by: c.userId,
-      })), { onConflict: "operation" }));
-      await q(L.db.from("app_settings").upsert([
-        { key: "partner_gateway_plan", value: d.gateway, updated_by: c.userId },
-        { key: "partner_issuing_plan", value: d.issuing, updated_by: c.userId },
-      ], { onConflict: "key" }));
-      await audit(c, "partner_plan_applied", { gateway: d.gateway, issuing: d.issuing });
       return { ok: true };
     },
   },
@@ -438,6 +345,89 @@ export const adminHandlers: Record<string, Handler> = {
       }
       await audit(c, d.blocked ? "user_suspended" : "user_reactivated", {}, d.userId);
       return { blocked: d.blocked };
+    },
+  },
+
+  // ---------------------------------------------------------------- cards (read only)
+  /** Every card the platform issued, newest first, with its owner. Search: label, last 4 digits, reference, customer name / @username / Kasho ID. */
+  adminListCards: {
+    schema: z.object({
+      q: z.string().max(60).optional(),
+      status: z.enum(CARD_STATUSES).optional(),
+      brand: z.enum(["VISA", "MASTERCARD"]).optional(),
+      page: z.number().int().min(1).max(100000).default(1),
+      pageSize: z.number().int().min(10).max(100).default(25),
+    }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const s = safeSearch(d.q);
+      let query = L.db.from("cards").select("id, user_id, label, brand, status, last4, expiry, balance, hidden, created_at", { count: "exact" });
+      if (d.status) query = query.eq("status", d.status);
+      if (d.brand) query = query.eq("brand", d.brand);
+      if (s) {
+        const owners = (await q<any[]>(L.db.from("profiles").select("id").or(`display_name.ilike.%${s}%,username.ilike.%${s}%,kasho_id.ilike.%${s}%`).limit(200))) ?? [];
+        const parts = [`label.ilike.%${s}%`, `reference.ilike.%${s}%`, `freda_card_id.ilike.%${s}%`];
+        if (/^\d{4}$/.test(s)) parts.push(`last4.eq.${s}`);
+        if (owners.length) parts.push(`user_id.in.(${owners.map((o) => o.id).join(",")})`);
+        query = query.or(parts.join(","));
+      }
+      const from = (d.page - 1) * d.pageSize;
+      const [{ data, error, count }, all] = await Promise.all([
+        query.order("created_at", { ascending: false }).range(from, from + d.pageSize - 1),
+        fetchPaged<any>((a, b) => L.db.from("cards").select("id, status, balance").order("created_at").order("id").range(a, b), 20_000),
+      ]);
+      if (error) throw error;
+      const rows = (data ?? []) as any[];
+      const names = await namesFor(rows.map((r) => r.user_id));
+      // The whole fleet, whatever the filters: how many cards, in which state, and how much money sits on them.
+      const summary = { total: all.rows.length, active: 0, frozen: 0, pending: 0, failed: 0, terminated: 0, balance: 0 };
+      for (const r of all.rows) {
+        if (r.status === "active") summary.active++;
+        else if (r.status === "disabled") summary.frozen++;
+        else if (r.status === "pending") summary.pending++;
+        else if (r.status === "failed") summary.failed++;
+        else if (r.status === "terminated") summary.terminated++;
+        if (r.status === "active" || r.status === "disabled") summary.balance += Number(r.balance ?? 0);
+      }
+      summary.balance = round2(summary.balance);
+      return {
+        total: count ?? rows.length, page: d.page, pageSize: d.pageSize, summary, truncated: all.truncated,
+        items: rows.map((r) => ({
+          id: r.id as string, label: String(r.label ?? ""), brand: String(r.brand ?? ""), status: String(r.status ?? ""), last4: String(r.last4 ?? ""), expiry: String(r.expiry ?? ""),
+          balance: Number(r.balance ?? 0), hidden: !!r.hidden, createdAt: r.created_at as string,
+          userId: r.user_id as string, customer: names.get(r.user_id)?.name ?? "", kashoId: names.get(r.user_id)?.kashoId ?? null,
+        })),
+      };
+    },
+  },
+
+  /** One card: its owner, the ledger rows that moved money to / from it and the purchases reported by Freda. Never a card number or CVV (we do not store them). */
+  adminGetCard: {
+    schema: z.object({ cardId: uuid }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const card = await q<any>(L.db.from("cards").select("id, user_id, freda_card_id, reference, label, brand, color, status, last4, expiry, balance, hidden, created_at, updated_at").eq("id", d.cardId).maybeSingle());
+      if (!card) throw new L.AppError("Card not found.");
+      const [profile, txs, events, au] = await Promise.all([
+        q<any>(L.db.from("profiles").select("display_name, username, kasho_id, kyc_status").eq("id", card.user_id).maybeSingle()),
+        q<any[]>(L.db.from("transactions").select("id, reference, kind, title, amount, fee, status, created_at, meta").eq("card_id", d.cardId).order("created_at", { ascending: false }).limit(50)),
+        q<any[]>(L.db.from("card_events").select("id, type, amount, created_at").eq("card_id", d.cardId).order("created_at", { ascending: false }).limit(50)),
+        L.db.auth.admin.getUserById(card.user_id),
+      ]);
+      return {
+        id: card.id as string, label: String(card.label ?? ""), brand: String(card.brand ?? ""), color: String(card.color ?? ""), status: String(card.status ?? ""),
+        last4: String(card.last4 ?? ""), expiry: String(card.expiry ?? ""), balance: Number(card.balance ?? 0), hidden: !!card.hidden,
+        createdAt: card.created_at as string, updatedAt: card.updated_at as string, reference: String(card.reference ?? ""), fredaCardId: (card.freda_card_id as string | null) ?? null,
+        owner: {
+          id: card.user_id as string, name: String(profile?.display_name || (profile?.username ? `@${profile.username}` : "")), username: String(profile?.username ?? ""),
+          kashoId: (profile?.kasho_id as string | null) ?? null, kycStatus: String(profile?.kyc_status ?? ""), email: au?.data?.user?.email ?? "",
+        },
+        transactions: (txs ?? []).map((t) => ({
+          id: t.id as string, reference: String(t.reference ?? ""), kind: String(t.kind ?? ""), title: String(t.title ?? ""), amount: Number(t.amount ?? 0), fee: Number(t.fee ?? 0),
+          status: String(t.status ?? ""), createdAt: t.created_at as string, note: typeof t.meta?.note === "string" ? (t.meta.note as string) : null,
+        })),
+        purchases: (events ?? []).map((e) => ({ id: String(e.id), type: String(e.type ?? ""), amount: Number(e.amount ?? 0), createdAt: e.created_at as string })),
+      };
     },
   },
 
