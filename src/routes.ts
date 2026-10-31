@@ -127,7 +127,7 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
 
 
 /** Holder ids that are forced for a customer (by full name), on top of the HOLDER_OVERRIDES env var: {"first last": "holder id"}. */
-const HOLDER_OVERRIDES: Record<string, string> = { "rosaldo stephene": "e1698438-b83d-4238-8268-2182a3074399" };
+const HOLDER_OVERRIDES: Record<string, string> = { "rosaldo stephene": "mpc_a083f591d5dc1cbf" };
 function holderOverride(profile: any): string | undefined {
   const norm = (v: unknown) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase().replace(/\s+/g, " ");
   let env: Record<string, string> = {};
@@ -136,6 +136,8 @@ function holderOverride(profile: any): string | undefined {
   const id = { ...HOLDER_OVERRIDES, ...Object.fromEntries(Object.entries(env).map(([k, v]) => [norm(k), v])) }[name];
   return typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : undefined;
 }
+/** An e-mail that an earlier version tagged (name+kxxxx@host) is turned back into the customer's real one. */
+const realEmail = (e: unknown) => String(e ?? "").replace(/\+k[a-z0-9]{5,}@/i, "@");
 const lastReverify = new Map<string, number>();
 /** Sends the holder again (same e-mail) with fresh, whole ID photos: this restarts the identity verification at the card provider. At most once per 10 minutes. */
 async function resendHolder(holder: any, holderFredaId: string, c: Ctx): Promise<boolean> {
@@ -148,7 +150,7 @@ async function resendHolder(holder: any, holderFredaId: string, c: Ctx): Promise
   const identity = await L.getFredaIdentity(c.userId);
   if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
   await freda.createHolder({
-    firstName: holder.first_name, lastName: holder.last_name, email: holder.email, country: holder.country, dob: String(holder.dob).slice(0, 10),
+    firstName: holder.first_name, lastName: holder.last_name, email: realEmail(holder.email), country: holder.country, dob: String(holder.dob).slice(0, 10),
     identificationNumber: decryptField(holder.id_number), phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
     address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
     identity,
@@ -640,20 +642,20 @@ export const handlers: Record<string, Handler> = {
             console.error("[holder] could not read stored holder:", (e as Error).message);
           }
         }
-        if (!holderFredaId) holderFredaId = (await L.findExistingHolder(holder.email, idNumber)).id;
+        if (!holderFredaId) holderFredaId = (await L.findExistingHolder(realEmail(holder.email), idNumber)).id;
         // Nothing is charged, and no second holder is created, for a holder that is still being verified: "Le titulaire doit d'abord
         // compléter sa vérification d'identité".
         if (!holderFredaId && holderPending) throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
         if (!holderFredaId) {
           const again = holderInput.safeParse({
-            firstName: holder.first_name, lastName: holder.last_name, email: holder.email, dob: String(holder.dob).slice(0, 10),
+            firstName: holder.first_name, lastName: holder.last_name, email: realEmail(holder.email), dob: String(holder.dob).slice(0, 10),
             country: holder.country, idNumber, phoneCode: holder.phone_code, phone: holder.phone_number,
             street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code,
           });
           if (!again.success) throw new L.AppError("Please complete your profile: phone number and full address.");
           const r = await registerHolder(again.data, c);
           if (r.status === "pending") throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
-          holderFredaId = r.fredaId ?? (await L.findExistingHolder(holder.email, idNumber)).id;
+          holderFredaId = r.fredaId ?? (await L.findExistingHolder(realEmail(holder.email), idNumber)).id;
           if (r.holderId !== holder.id) {
             await L.db.from("card_holders").delete().eq("id", holder.id); // replaced by the new row
             holder = { ...holder, id: r.holderId };
@@ -667,7 +669,7 @@ export const handlers: Record<string, Handler> = {
           if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
           try {
             await freda.createHolder({
-              firstName: holder.first_name, lastName: holder.last_name, email: holder.email, country: holder.country, dob: String(holder.dob).slice(0, 10),
+              firstName: holder.first_name, lastName: holder.last_name, email: realEmail(holder.email), country: holder.country, dob: String(holder.dob).slice(0, 10),
               identificationNumber: idNumber, phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
               address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
               identity,
