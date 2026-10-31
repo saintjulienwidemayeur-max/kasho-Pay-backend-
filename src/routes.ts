@@ -710,7 +710,9 @@ export const handlers: Record<string, Handler> = {
         }
         if (res?.status && L.normalizeCardStatus(res.status) !== "pending") {
           const { data: row } = await L.db.from("cards").select("*").eq("id", cardId).single();
-          await L.applyCardStatus(row, res.status);
+          const why = pickVerification(res);
+          if (L.normalizeCardStatus(res.status) === "failed") console.error("[card] Freda created the card as failed:", reference, "reason:", String(res.failure_reason ?? why.reason ?? "(none)").slice(0, 300));
+          await L.applyCardStatus(row, res.status, {}, { reason: res.failure_reason ?? why.reason, link: why.link, linkExpiresAt: why.expiresAt });
         }
       } catch (e) {
         console.error("[card] created at Freda but not fully recorded yet, the sync will finish it:", reference, (e as Error).message);
