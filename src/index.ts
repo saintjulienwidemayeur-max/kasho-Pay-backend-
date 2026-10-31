@@ -7,7 +7,7 @@ import * as L from "./ledger.js";
 import { freda, fredaConfigured, fredaMode, readMasterWallet, verifyWebhookSignature } from "./freda.js";
 import { getConfig } from "./config.js";
 import { isSuspended } from "./security.js";
-import { MFA_REQUIRED_ERROR, MFA_SETUP_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, require2faAll, stepUpLocked, tokenAal } from "./stepup.js";
+import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { initPush, runMorningGreetings } from "./push.js";
@@ -203,7 +203,6 @@ async function stepUp(req: AuthedRequest, res: Response, next: NextFunction) {
   const rule = Object.prototype.hasOwnProperty.call(STEP_UP, name) ? STEP_UP[name] : undefined;
   if (!rule && !mfaEndpointRequired(name)) return next();
   const ctx = req.ctx!;
-  if (!req.mfaRequired && require2faAll()) return res.status(403).json(MFA_SETUP_REQUIRED_ERROR);
   if (mfaBlocked(!!req.mfaRequired, req.aal)) return res.status(403).json(MFA_REQUIRED_ERROR);
   if (!rule || !rule.field) return next(); // 2FA-only rule (card details): the card code is verified by the handler
   const pw = req.body?.[rule.field];

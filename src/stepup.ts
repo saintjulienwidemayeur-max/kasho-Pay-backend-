@@ -39,23 +39,12 @@ export function enforceMfaAll(value: string | undefined = process.env["ENFORCE_M
   return String(value ?? "").trim().toLowerCase() !== "false";
 }
 
-/**
- * Two-factor authentication is mandatory for every customer (default ON, REQUIRE_2FA_ALL=false turns it off): a user without a
- * verified TOTP factor is refused on the money / personal-data endpoints until the web app has made them set it up.
- */
-export function require2faAll(value: string | undefined = process.env["REQUIRE_2FA_ALL"]): boolean {
-  return String(value ?? "").trim().toLowerCase() !== "false";
-}
-
 export function mfaEndpointRequired(name: string, enforceAll = enforceMfaAll()): boolean {
   return enforceAll && MFA_ENDPOINTS.has(name);
 }
 
 /** The one error body (HTTP 403) every endpoint that needs a 2FA-verified session answers with. */
 export const MFA_REQUIRED_ERROR = { error: { message: "Enter your 2FA code to continue.", code: "MFA_REQUIRED" } } as const;
-
-/** HTTP 403 for a user who has not set up 2FA yet (the web app shows its 2FA setup screen). */
-export const MFA_SETUP_REQUIRED_ERROR = { error: { message: "Turn on two-factor authentication (2FA) to continue.", code: "MFA_SETUP_REQUIRED" } } as const;
 
 /** True when the request must be refused with MFA_REQUIRED: the user has 2FA but the session is not aal2. */
 export function mfaBlocked(hasTotp: boolean, aal: string | undefined): boolean {
