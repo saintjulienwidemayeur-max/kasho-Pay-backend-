@@ -18,7 +18,7 @@ test("admin needs a verified TOTP factor and an aal2 session", () => {
   assert.equal(adminMfaOk({ mfa: true, aal: "aal1" }), false);
   assert.equal(adminMfaOk({ mfa: false, aal: "aal2" }), false);
   assert.equal(adminMfaOk({}), false);
-  assert.equal(ADMIN_MFA_MESSAGE, "Turn on two-factor authentication to manage fees.");
+  assert.equal(ADMIN_MFA_MESSAGE, "Turn on two-factor authentication to use the admin tools.");
 });
 
 test("MFA is enforced by default and gives one consistent MFA_REQUIRED error", () => {

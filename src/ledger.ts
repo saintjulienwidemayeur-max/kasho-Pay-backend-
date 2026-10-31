@@ -147,6 +147,25 @@ export async function patchTx(id: string, patch: Record<string, unknown>) {
   if (error) throw error;
 }
 
+/**
+ * Remembers what Freda really charged for a settled operation (read by the profit report in the admin page).
+ * Only finite, non-negative numbers are kept. Never blocks or fails the money flow it is called from.
+ */
+export async function recordProviderFee(txId: string, patch: Record<string, unknown>) {
+  const clean: Record<string, number> = {};
+  for (const [k, v] of Object.entries(patch)) {
+    const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+    if (typeof n === "number" && Number.isFinite(n) && n >= 0) clean[k] = n;
+  }
+  if (!Object.keys(clean).length) return;
+  try {
+    const t = await getTx(txId);
+    if (t) await mergeTxMeta(t, clean);
+  } catch (e) {
+    console.error("[fees] could not record the provider fee:", (e as Error).message);
+  }
+}
+
 /** Corrects the amounts of a row that is still pending (never a settled one: its money has already moved). */
 export async function adjustPendingTx(id: string, patch: { amount?: number; fee?: number }) {
   const { error } = await db.from("transactions").update(patch).eq("id", id).eq("status", "pending");
@@ -225,6 +244,7 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
       if (payout?.id) await patchTx(tx.id, { provider_ref: payout.id });
     }
     if (payout?.status === "success") {
+      await recordProviderFee(tx.id, { payout_fee_htg: payout?.fee }); // Freda's 5 % payout fee, for the profit report
       if (await completeTx(tx.id)) {
         await notify(tx.user_id, "Withdrawal sent", `${money(Math.abs(tx.amount))} sent to ${tx.method}`);
       }
@@ -267,6 +287,7 @@ export async function settleTransaction(tx: any): Promise<"pending" | "completed
       throw e;
     }
     if (await completeTx(tx.id)) {
+      await recordProviderFee(tx.id, { provider_fee_usd: res?.fee });
       const real = readCardDetails(res).balance;
       await db.from("cards").update({ balance: real ?? round2(Number(card.balance ?? 0) + amount) }).eq("id", card.id);
       await notify(tx.user_id, "Card funded", `${money(amount)} added to ${card.label}.`);
@@ -459,6 +480,21 @@ export async function markCardGone(card: any, closure?: { refunded: number; fee:
   return { ...card, status: "terminated", balance: 0 };
 }
 
+/** Keeps one row per card movement (Freda charges per purchase, so the profit report counts them). A replay is ignored. */
+async function recordCardEvent(card: any, d: any) {
+  const id = typeof d?.id === "string" ? d.id.slice(0, 80) : "";
+  if (!id) return;
+  const amount = Math.abs(Number(d?.amount));
+  try {
+    const { error } = await db.from("card_events").upsert({
+      id, card_id: card.id, user_id: card.user_id, type: String(d?.type ?? "").slice(0, 30), amount: Number.isFinite(amount) ? round2(amount) : 0,
+    }, { onConflict: "id", ignoreDuplicates: true });
+    if (error) console.error("[card-events]", error.message); // table missing until 20261101000000_admin_panel.sql is run
+  } catch (e) {
+    console.error("[card-events]", (e as Error).message);
+  }
+}
+
 /**
  * A card.* webhook event (Freda docs, Notifications). Statuses come from the event; money-moving details do not:
  *  - card.terminated: refunded_usd + closure_fee_usd say what really came back, the wallet gets exactly that;
@@ -474,8 +510,8 @@ export async function handleCardEvent(type: string, d: any) {
   switch (type) {
     case "card.terminated": await markCardGone(card, readClosure(d)); break;
     case "card.failed": await applyCardStatus(card, "failed", {}, { reason: d?.failure_reason, link: d?.verification_link, linkExpiresAt: d?.verification_link_expires_at }); break;
-    case "card.balance_updated":
-    case "card.transaction": await syncCardRow(card); break;
+    case "card.balance_updated": await syncCardRow(card); break;
+    case "card.transaction": await recordCardEvent(card, d); await syncCardRow(card); break;
     case "card.created": await applyCardStatus(card, "active"); break;
     case "card.frozen": await applyCardStatus(card, "disabled"); break;
     case "card.unfrozen": await applyCardStatus(card, "active"); break;

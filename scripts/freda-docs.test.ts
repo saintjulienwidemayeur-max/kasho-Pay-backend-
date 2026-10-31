@@ -79,7 +79,7 @@ test("readClosure: refunded_usd + closure_fee_usd from the API answer or the web
 
 test("readMasterWallet: spendable = balance minus the locked guarantee deposit", () => {
   assert.deepEqual(readMasterWallet({ mode: "live", balance: 320.5, guarantee_usd: 50, spendable_usd: 270.5, reserved_on_cards_usd: 140, active_cards: 6, low_balance: false }),
-    { balance: 320.5, guarantee: 50, spendable: 270.5, low: false });
+    { balance: 320.5, guarantee: 50, spendable: 270.5, low: false, reservedOnCards: 140, activeCards: 6, mode: "live" });
   assert.equal(readMasterWallet({ balance: 60, guarantee_usd: 50, spendable_usd: 10, low_balance: true })?.low, true);
   assert.equal(readMasterWallet({ balance: 60 }), null);
   assert.equal(readMasterWallet(null), null);
@@ -375,7 +375,7 @@ test("Freda client: Master Wallet endpoint", async () => {
   let url = "";
   globalThis.fetch = (async (u: any) => { url = String(u); return new Response(JSON.stringify({ balance: 100, spendable_usd: 50, guarantee_usd: 50, low_balance: false }), { status: 200 }); }) as any;
   try {
-    assert.deepEqual(readMasterWallet(await freda.masterWallet()), { balance: 100, guarantee: 50, spendable: 50, low: false });
+    assert.deepEqual(readMasterWallet(await freda.masterWallet()), { balance: 100, guarantee: 50, spendable: 50, low: false, reservedOnCards: 0, activeCards: 0, mode: null });
     assert.ok(url.endsWith("/v1/master-wallet"));
   } finally { globalThis.fetch = realFetch2; }
 });

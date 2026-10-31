@@ -102,6 +102,9 @@ export const PUSH_RULES: Rule[] = [
     "Confirmez le changement avec le lien envoyé par e-mail. Si ce n'était pas vous, changez votre mot de passe maintenant.")] },
   { title: "Password changed", fr: "Mot de passe modifié", bodies: [exact("Your password was changed. If this was not you, contact support now.",
     "Votre mot de passe a été modifié. Si ce n'était pas vous, contactez le support maintenant.")] },
+  { title: "Balance adjusted", fr: "Solde ajusté", bodies: [
+    [new RegExp(`^${AMT} was added to your wallet by Kasho Pay\\.$`), (m) => `${m[1]} ont été ajoutés à votre portefeuille par Kasho Pay.`],
+    [new RegExp(`^${AMT} was removed from your wallet by Kasho Pay\\.$`), (m) => `${m[1]} ont été retirés de votre portefeuille par Kasho Pay.`]] },
   { title: "Money received", fr: "Argent reçu", bodies: [[new RegExp(`^(.+) sent you ${AMT}$`), (m) => `${m[1]} vous a envoyé ${m[2]}`]] },
   { title: "Money sent", fr: "Argent envoyé", bodies: [[new RegExp(`^${AMT} sent to (.+?)(?: \\(fee ${AMT}\\))?$`),
     (m) => `${m[1]} envoyés à ${m[2]}${m[3] ? ` (frais ${m[3]})` : ""}`]] },

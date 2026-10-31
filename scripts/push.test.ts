@@ -113,6 +113,7 @@ const SAMPLES: Record<string, string[]> = {
   "Money received": ["Marie sent you $12.00"],
   "Money sent": ["$12.00 sent to Jean", "$12.00 sent to Jean (fee $0.50)"],
   "Dispute submitted": ["DSP-12345 for Money sent"],
+  "Balance adjusted": ["$25.00 was added to your wallet by Kasho Pay.", "$10.50 was removed from your wallet by Kasho Pay."],
 };
 
 test("every notify() call in src has a French translation", () => {

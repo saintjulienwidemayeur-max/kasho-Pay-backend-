@@ -5,17 +5,17 @@ import * as L from "./ledger.js";
 import { readCardDetails } from "./ledger.js";
 import { freda, FredaError, fredaConfigured, fredaMode, pickArray, pickId, readClosure } from "./freda.js";
 import { closureFee, getConfig, normalizeHaitiPhone, round2 } from "./config.js";
-import { FEE_OPERATIONS, TIERED_OPERATIONS, amountRange, computeFee, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
+import { adminHandlers } from "./admin.js";
+import { amountRange, computeFee } from "./fees.js";
 import { decryptField, encryptField, hashCardCode, verifyCardCode } from "./crypto.js";
 import { clearStepUpFailures, recordStepUpFailure, stepUpLocked } from "./stepup.js";
 import { cardCodeAttemptAllowed, resetCardCodeAttempts } from "./cardcode.js";
 import { MAX_SUBSCRIPTIONS_PER_USER, isAllowedPushEndpoint, pushConfigured, pushPublicKey, sendTestPush, validPushKeys, validTimeZone } from "./push.js";
 import { createSession, diditConfigured, getDecision, mapStatus } from "./didit.js";
 
-export type Ctx = { userId: string; email: string; ip: string | null; ua: string | null; token?: string;
-  /** The user has a verified TOTP factor. */ mfa?: boolean;
-  /** Assurance level of the access token ("aal2" = 2FA code passed in this session). */ aal?: "aal1" | "aal2" };
-type Handler = { schema: z.ZodTypeAny; run: (d: any, c: Ctx) => Promise<unknown> };
+export type { Ctx } from "./types.js";
+type Handler = import("./types.js").Handler;
+type Ctx = import("./types.js").Ctx;
 
 const provider = z.enum(["moncash", "natcash"]);
 const providerName = (p: string) => (p === "moncash" ? "MonCash" : "NatCash");
@@ -111,19 +111,8 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
   };
 }
 
-export const ADMIN_MFA_MESSAGE = "Turn on two-factor authentication to manage fees.";
-
-/** Admin access also needs a verified TOTP factor AND an aal2 session (2FA code passed in this session). */
-export function adminMfaOk(c: Pick<Ctx, "mfa" | "aal">): boolean {
-  return c.mfa === true && c.aal === "aal2";
-}
-
-/** Only users listed in the `admins` table (server-only) may change fees, and only with 2FA. */
-async function requireAdmin(c: Ctx) {
-  if (!adminMfaOk(c)) throw new L.AppError(ADMIN_MFA_MESSAGE);
-  const { data } = await L.db.from("admins").select("user_id").eq("user_id", c.userId).maybeSingle();
-  if (!data) throw new L.AppError("You do not have access to this.");
-}
+// Admin access (2FA, roles) lives in admin.ts; re-exported here for the tests that import it from this module.
+export { ADMIN_MFA_MESSAGE, adminMfaOk } from "./admin.js";
 
 /** Text of a Freda error body, only for matching (never logged or shown). */
 const rawText = (raw: unknown) => { try { return JSON.stringify(raw ?? ""); } catch { return ""; } };
@@ -135,17 +124,6 @@ export const idempotencyKey = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
 export function sameTransfer(prev: { amount: unknown; counterparty_id: unknown }, toId: string, amount: number): boolean {
   return prev.counterparty_id === toId && Math.abs(Math.abs(Number(prev.amount)) - amount) < 0.005;
 }
-
-const feeRuleInput = z.object({
-  id: z.string().uuid().optional(),
-  operation: z.enum(FEE_OPERATIONS),
-  label: z.string().trim().max(80).default(""),
-  feeType: z.enum(["flat", "percent"]),
-  minAmount: z.number().min(0).max(100000).nullable().default(null),
-  maxAmount: z.number().min(0).max(100000).nullable().default(null),
-  feeValue: z.number().min(0).max(100000),
-  active: z.boolean().default(true),
-});
 
 export const handlers: Record<string, Handler> = {
   // ---------------------------------------------------------------- config
@@ -211,69 +189,6 @@ export const handlers: Record<string, Handler> = {
   sendTestPush: {
     schema: z.object({}).passthrough(),
     run: async (_d, c) => ({ sent: await sendTestPush(c.userId) }),
-  },
-
-  // ---------------------------------------------------------------- admin: fee schedule
-  adminStatus: {
-    schema: z.object({}).passthrough(),
-    run: async (_d, c) => {
-      const { data } = await L.db.from("admins").select("user_id").eq("user_id", c.userId).maybeSingle();
-      return { isAdmin: !!data };
-    },
-  },
-
-  /** Every fee rule, including inactive ones. */
-  adminListFees: {
-    schema: z.object({}).passthrough(),
-    run: async (_d, c) => {
-      await requireAdmin(c);
-      const { data, error } = await L.db.from("fee_rules").select("*").order("operation").order("min_amount", { nullsFirst: true });
-      if (error) throw error;
-      return { operations: FEE_OPERATIONS, tiered: TIERED_OPERATIONS, rules: (data ?? []).map(rowToRule) };
-    },
-  },
-
-  /** Creates a rule (no id) or updates one (id). Password is checked by the step-up middleware. */
-  adminSaveFee: {
-    schema: feeRuleInput.extend({ confirmPassword: z.string().optional() }),
-    run: async (d, c) => {
-      await requireAdmin(c);
-      const { data: all, error: listErr } = await L.db.from("fee_rules").select("*");
-      if (listErr) throw listErr;
-      const others: FeeRule[] = (all ?? []).map(rowToRule);
-      const rule = {
-        ...(d.id ? { id: d.id } : {}), operation: d.operation as FeeOperation, feeType: d.feeType,
-        minAmount: d.minAmount, maxAmount: d.maxAmount, feeValue: Math.round(d.feeValue * 10000) / 10000, active: d.active,
-      };
-      if (d.id && !others.some((o) => o.id === d.id)) throw new L.AppError("Fee rule not found.");
-      const problem = validateRule(rule, others);
-      if (problem) throw new L.AppError(problem);
-      const row = {
-        operation: rule.operation, label: d.label, fee_type: rule.feeType, min_amount: rule.minAmount, max_amount: rule.maxAmount,
-        fee_value: rule.feeValue, active: rule.active, updated_by: c.userId,
-      };
-      const { data, error } = d.id
-        ? await L.db.from("fee_rules").update(row).eq("id", d.id).select("*").single()
-        : await L.db.from("fee_rules").insert(row).select("*").single();
-      if (error) throw error;
-      await L.db.from("activity_log").insert({
-        user_id: c.userId, event: "Fee rule changed", detail: `${rule.operation} ${rule.feeType} ${rule.feeValue} [${rule.minAmount ?? ""}-${rule.maxAmount ?? ""}] active=${rule.active}`,
-        ip: c.ip, user_agent: c.ua,
-      });
-      return rowToRule(data);
-    },
-  },
-
-  adminDeleteFee: {
-    schema: z.object({ id: z.string().uuid(), confirmPassword: z.string().optional() }),
-    run: async (d, c) => {
-      await requireAdmin(c);
-      const { data, error } = await L.db.from("fee_rules").delete().eq("id", d.id).select("operation");
-      if (error) throw error;
-      if (!data?.length) throw new L.AppError("Fee rule not found.");
-      await L.db.from("activity_log").insert({ user_id: c.userId, event: "Fee rule deleted", detail: String(data[0].operation), ip: c.ip, user_agent: c.ua });
-      return { ok: true };
-    },
   },
 
   // ---------------------------------------------------------------- activity
@@ -719,9 +634,10 @@ export const handlers: Record<string, Handler> = {
         user: c.userId, kind: "card_fund", title: `Added to ${card.label}`, category: "Card",
         method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee, card: card.id,
       });
+      let res: any;
       try {
         // The ledger reference is the idempotency key, so a retry of the same request can never fund the card twice.
-        await freda.fundCard(card.freda_card_id, amount, (await L.getTx(txId)).reference);
+        res = await freda.fundCard(card.freda_card_id, amount, (await L.getTx(txId)).reference);
       } catch (e) {
         if (e instanceof FredaError && e.ambiguous) {
           // unknown outcome: never auto-refund
@@ -732,6 +648,7 @@ export const handlers: Record<string, Handler> = {
         throw e;
       }
       await L.completeTx(txId);
+      await L.recordProviderFee(txId, { provider_fee_usd: res?.fee }); // what Freda charged, for the profit report
       await L.db.from("cards").update({ balance: round2(Number(card.balance) + amount) }).eq("id", card.id);
       return { ok: true };
     },
@@ -757,14 +674,16 @@ export const handlers: Record<string, Handler> = {
         method: `Card •••• ${card.last4 ?? ""}`.trim(), amount, fee, status: "pending", card_id: card.id, provider: "freda",
         meta: { freda_balance_before: before },
       });
+      let res: any;
       try {
-        await freda.withdrawCard(card.freda_card_id, amount, tx.reference);
+        res = await freda.withdrawCard(card.freda_card_id, amount, tx.reference);
       } catch (e) {
         // Ambiguous (timeout/5xx): leave it pending, the reconcile loop compares balances and settles it.
         if (!(e instanceof FredaError && e.ambiguous)) await L.failTx(tx.id, "Provider rejected the withdrawal");
         throw e;
       }
       await L.completeTx(tx.id); // credits the wallet once
+      await L.recordProviderFee(tx.id, { provider_fee_usd: res?.fee }); // what Freda charged, for the profit report
       await L.db.from("cards").update({ balance: round2(Math.max(0, before - amount)) }).eq("id", card.id);
       return { ok: true };
     },
@@ -975,3 +894,6 @@ export const handlers: Record<string, Handler> = {
     },
   },
 };
+
+// The admin panel endpoints (adminOverview, adminListUsers, adminAdjustBalance...) live in admin.ts.
+Object.assign(handlers, adminHandlers);

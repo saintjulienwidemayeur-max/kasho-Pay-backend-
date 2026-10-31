@@ -78,6 +78,12 @@ export function noStore(_req: any, res: any, next: any) {
 }
 
 // ------------------------------------------------------------ misc
+/** True while a Supabase user is banned (the admin panel suspends a customer with ban_duration). */
+export function isSuspended(user: { banned_until?: string | null } | null | undefined): boolean {
+  const until = user?.banned_until ? Date.parse(user.banned_until) : NaN;
+  return Number.isFinite(until) && until > Date.now();
+}
+
 export function bearerToken(header: string | undefined | null): string | null {
   const m = /^Bearer ([A-Za-z0-9._~+\/=-]{10,4096})$/.exec(header ?? "");
   return m ? m[1]! : null;

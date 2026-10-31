@@ -6,6 +6,7 @@ import { supabaseAdmin } from "./supabase.js";
 import * as L from "./ledger.js";
 import { freda, fredaConfigured, fredaMode, readMasterWallet, verifyWebhookSignature } from "./freda.js";
 import { getConfig } from "./config.js";
+import { isSuspended } from "./security.js";
 import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
@@ -152,6 +153,12 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   sendTestPush: { windowMs: MIN, max: 3 },
   adminSaveFee: { windowMs: MIN, max: 20 },
   adminDeleteFee: { windowMs: MIN, max: 20 },
+  adminAdjustBalance: { windowMs: MIN, max: 10 },
+  adminSetUserBlocked: { windowMs: MIN, max: 10 },
+  adminSavePartnerCost: { windowMs: MIN, max: 20 },
+  adminApplyPartnerPlan: { windowMs: MIN, max: 5 },
+  adminOverview: { windowMs: MIN, max: 30 },
+  adminFredaFunds: { windowMs: MIN, max: 20 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();
 for (const [name, l] of Object.entries(endpointLimits)) {
@@ -169,6 +176,8 @@ async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction
     if (error || !data.user) return res.status(401).json({ error: { message: "Your session expired. Please log in again." } });
     // Money endpoints are only for users who confirmed their email.
     if (!data.user.email_confirmed_at) return res.status(403).json({ error: { message: "Please verify your email first." } });
+    // A suspended customer (admin panel) is refused at once, even with an access token that has not expired yet.
+    if (isSuspended(data.user)) return res.status(403).json({ error: { message: "This account is suspended. Contact support.", code: "ACCOUNT_SUSPENDED" } });
     req.mfaRequired = hasVerifiedTotp(data.user);
     req.aal = tokenAal(token);
     req.ctx = {

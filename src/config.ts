@@ -17,6 +17,8 @@ export function getConfig() {
     cardClosureFeeUsd: num("CARD_CLOSURE_FEE_USD", 0.5),
     // Warn in the logs when the cards Master Wallet has less than this spendable (guarantee deposit excluded)
     masterWalletAlertUsd: num("MASTER_WALLET_ALERT_USD", 25),
+    // Largest single balance adjustment an admin can make on a customer wallet (USD)
+    adminMaxAdjustUsd: num("ADMIN_MAX_ADJUST_USD", 10000),
     // Rolling 24h caps per user (0 disables a cap)
     dailyTransferLimitUsd: num("DAILY_TRANSFER_LIMIT_USD", 2000),
     dailyWithdrawLimitUsd: num("DAILY_WITHDRAW_LIMIT_USD", 2000),
