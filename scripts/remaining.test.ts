@@ -8,7 +8,7 @@ const L: any = await import("../src/ledger.js");
 const { FredaError, freda } = await import("../src/freda.js");
 const { DiditError } = await import("../src/didit.js");
 const { adminMfaOk, ADMIN_MFA_MESSAGE, idempotencyKey, sameTransfer } = await import("../src/routes.js");
-const { enforceMfaAll, mfaBlocked, mfaEndpointRequired, MFA_REQUIRED_ERROR, MFA_ENDPOINTS, STEP_UP } = await import("../src/stepup.js");
+const { require2faAll, MFA_SETUP_REQUIRED_ERROR, enforceMfaAll, mfaBlocked, mfaEndpointRequired, MFA_REQUIRED_ERROR, MFA_ENDPOINTS, STEP_UP } = await import("../src/stepup.js");
 
 const UNAVAILABLE = "This service is temporarily unavailable. Please try again later.";
 const quiet = <T>(fn: () => T): T => { const e = console.error; console.error = () => {}; try { return fn(); } finally { console.error = e; } };
@@ -200,4 +200,12 @@ test("card_fund without a flag (server crashed after the debit): replayed only a
     assert.equal(await L.settleTransaction(crashed), "completed");
     assert.deepEqual(args, ["card_9", 20, "KP-1"]);
   });
+});
+
+test("2FA is mandatory by default; REQUIRE_2FA_ALL=false turns it off", () => {
+  assert.equal(require2faAll(undefined), true);
+  assert.equal(require2faAll(""), true);
+  assert.equal(require2faAll("true"), true);
+  assert.equal(require2faAll("false"), false);
+  assert.equal(MFA_SETUP_REQUIRED_ERROR.error.code, "MFA_SETUP_REQUIRED");
 });
