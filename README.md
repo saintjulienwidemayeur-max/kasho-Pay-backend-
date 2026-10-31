@@ -58,7 +58,7 @@ Fees are rows of the `fee_rules` table (migration `supabase/migrations/202610210
 | Virtual card withdrawal (`card_withdraw`) | $2.15 |
 | Kasho to Kasho transfer (`transfer`) | 1.5 % per transaction |
 
-Who pays: top-up fee is kept from the amount credited (pay $10, wallet gets $10 - fee); withdrawal, card top-up and transfer fees are added on top (the wallet pays amount + fee); the card withdrawal fee is taken from the amount moved back to the wallet. Closing a card returns its balance without a fee. Brackets match when `min <= amount <= max`; a shared boundary ($10) belongs to the lower bracket. Top-ups and withdrawals outside the brackets ($5-$100) are refused. Fees are re-read on every request, so a change applies immediately. `getPublicConfig` returns the schedule (`fees`) for the app.
+Who pays: top-up fee is kept from the amount credited (pay $10, wallet gets $10 - fee); withdrawal, card top-up and transfer fees are added on top (the wallet pays amount + fee); the card withdrawal fee is taken from the amount moved back to the wallet. Closing a card returns its balance minus Freda's closing fee ($0.50, never more than what is left on the card; `CARD_CLOSURE_FEE_USD`): the wallet is credited exactly what Freda sends back to the Master Wallet (`refunded_usd`). Brackets match when `min <= amount <= max`; a shared boundary ($10) belongs to the lower bracket. Top-ups and withdrawals outside the brackets ($5-$100) are refused. Fees are re-read on every request, so a change applies immediately. `getPublicConfig` returns the schedule (`fees`) for the app.
 
 Admin page API: add yourself once in the SQL editor (`insert into public.admins (user_id) values ('<auth user uuid>');`), then call `adminListFees`, `adminSaveFee` (create when no `id`, otherwise update; sends `confirmPassword`) and `adminDeleteFee`. The server validates brackets (no overlap, one fee for non-bracket operations).
 
@@ -105,6 +105,15 @@ Create a **Web Service**, language **Node**, repo root = this folder (leave Root
 - Pending money is now recovered automatically: an ambiguous `card_fund` is replayed (same Freda `reference`) for 24 h, a card creation without a Freda card id is replayed with the same `reference`. Underpaid deposits are not credited, are flagged `meta.underpaid / needs_refund` and logged.
 - `changePassword` signs out all other sessions of the user.
 - Legacy `kyc-documents` storage policies dropped (the backend only uses the private `kyc-docs` bucket).
+
+## Freda Issuing docs update of 30 Oct 2026 (migration `20261031000000_kyc_doc_back.sql`)
+What changed in https://issuing.fredapay.com/docs and what the backend does about it:
+- **Card closing fee**: `POST /cards/:id/terminate` and the `card.terminated` webhook now give `refunded_usd` and `closure_fee_usd` ($0.50, never more than what is left on the card). The closing row carries that fee, so the wallet gets what really came back (before, it was credited the full balance and the platform paid the fee). The app shows the fee before the user confirms (`getPublicConfig.cardClosureFeeUsd`).
+- **ID document back**: `identity.imageBackUrl` is required for some countries. The back of the ID is now saved from Didit (`profiles.kyc_doc_back_path`, `''` = the document has no back) and sent with the front. Users verified earlier are refreshed from Didit the first time a holder is created. Run the migration; until then everything works without the back.
+- **`card.failed`**: `failure_reason` and `verification_link` (+ expiry) are kept in the creation transaction's `meta` (`card_failure_reason`, `verification_link`) for support. Users still see the fixed "We could not create your card" message and are refunded.
+- **`card.balance_updated`, `card.transaction`** (now with `card_balance`): the card is re-read from Freda and its balance refreshed (never trusting the payload). `card.transaction` names the card in `card_id`.
+- **Master Wallet** (`GET /v1/master-wallet`): Freda locks a guarantee deposit (50 USD by default) in it; only `spendable_usd` can pay card creations and top-ups (`BELOW_MINIMUM_BALANCE` otherwise). The backend prints it at startup and logs `[master-wallet] LOW` every 30 minutes while it is below `MASTER_WALLET_ALERT_USD` (default 25) or Freda says `low_balance`.
+- Not used by Kasho Pay: crypto wallets (`/v1/crypto/*`), business cards (`BUSINESS_CARDS_PAUSED`).
 
 ## Web Push notifications (migration `20261025000000_push_subscriptions.sql`)
 - Setup: run `npm run vapid:generate`, put `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (`mailto:` or https URL) in the environment (Render: dashboard, `sync: false`), run the migration. Without the keys push is silently disabled (one startup warning).

@@ -24,6 +24,7 @@ Before starting: run every file in `supabase/migrations/` in order, set `.env` (
 - [ ] Withdraw $10: wallet pays $10.70 after password confirmation; wrong password shows the inline error.
 - [ ] Transfer A to B of $10: A pays $10.15, B receives $10.00; repeating the same request (double click) sends only once.
 - [ ] Create a card (fee $10 + prefund), fund it ($2.30 fee), move money back ($2.15 fee), reveal details with the 4-digit code, freeze, close.
+- [ ] Close a card holding $12: the dialog mentions the $0.50 closing fee, the wallet gets $11.50, the closing row shows fee $0.50, a card with less than $0.50 left gives back nothing.
 - [ ] Turn on 2FA for A: transfers, card actions and withdrawals now ask for the 6-digit code once, then continue.
 - [ ] Admin: add B to `public.admins`, turn on 2FA, change a fee in the admin API; an admin without 2FA is refused.
 

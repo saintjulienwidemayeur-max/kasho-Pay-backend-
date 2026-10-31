@@ -28,3 +28,11 @@ Authentication > Sign In / Providers > Email:
 - Secure email change: ON (both the old and new address must confirm)
 - Secure password change: ON (a recent login is required to change the password)
 - Also Authentication > Multi-Factor: TOTP enabled.
+
+## 7. Going live with Freda Pay Issuing
+- Live key: `FREDA_API_KEY=sk_live_...` (Render). The account must have Live (KYC/KYB) and **Issuing Live** approved, otherwise Freda answers `LIVE_NOT_ENABLED` / `ISSUING_LIVE_NOT_ENABLED` (users see "temporarily unavailable").
+- Webhook: a test-key webhook is not a live one. Run `npm run webhook:register -- https://<backend>` with the live key and put the new `whsec_...` in `FREDA_WEBHOOK_SECRET`. Events used: `payment.*`, `payout.*`, `card.created`, `card.failed`, `card.frozen`, `card.unfrozen`, `card.terminated`, `card.balance_updated`, `card.transaction`.
+- Master Wallet (cards): deposit real USD in the Freda dashboard. 50 USD of it stays locked as the guarantee, only the rest (`spendable`) pays card creations ($10 + prefund) and top-ups. In Live only a real deposit credits it. The backend prints the figures at startup and logs `[master-wallet] LOW` (alert threshold `MASTER_WALLET_ALERT_USD`): watch for that line.
+- Gateway balance (HTG) funds withdrawals to MonCash / NatCash: Freda sends them one at a time, about 2 minutes apart, so several withdrawals take a while to arrive.
+- Fees: Freda charges 5 % on payouts and $0.50 when a card is closed; make sure the fee schedule (`fee_rules`) covers your costs.
+- Run every new migration before deploying (latest: `20261031000000_kyc_doc_back.sql`).

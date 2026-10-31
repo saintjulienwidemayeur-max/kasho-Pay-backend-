@@ -102,6 +102,8 @@ export const freda = {
     call("POST", "/v1/payouts", b),
   getPayout: (id: string) => call("GET", `/v1/payouts/${encodeURIComponent(id)}`),
   balance: () => call("GET", "/v1/balance"),
+  /** Cards issuer wallet: balance, guarantee deposit (always locked), spendable, low_balance. */
+  masterWallet: () => call("GET", "/v1/master-wallet"),
 
   // Cards
   createHolder: (b: Record<string, unknown>) => call("POST", "/v1/cards/holders", b),
@@ -122,6 +124,30 @@ export const freda = {
   terminateCard: (id: string) => call("POST", `/v1/cards/${encodeURIComponent(id)}/terminate`),
   revealCard: (id: string) => call("POST", `/v1/cards/${encodeURIComponent(id)}/reveal`),
 };
+
+const usdOrNull = (v: unknown): number | null => {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return typeof n === "number" && Number.isFinite(n) && n >= 0 ? Math.round((n + Number.EPSILON) * 100) / 100 : null;
+};
+
+/**
+ * What a card closure really did on Freda's side: POST /cards/:id/terminate and the card.terminated webhook both
+ * carry `refunded_usd` (sent back to the Master Wallet) and `closure_fee_usd` (kept by Freda). Null when absent.
+ */
+export function readClosure(o: any): { refunded: number; fee: number } | null {
+  const src = o?.data ?? o ?? {};
+  const refunded = usdOrNull(src.refunded_usd);
+  const fee = usdOrNull(src.closure_fee_usd);
+  return refunded === null || fee === null ? null : { refunded, fee };
+}
+
+/** Master Wallet figures from GET /v1/master-wallet (the guarantee deposit is always locked: only `spendable` can be used). */
+export function readMasterWallet(o: any): { balance: number; guarantee: number; spendable: number; low: boolean } | null {
+  const balance = usdOrNull(o?.balance);
+  const spendable = usdOrNull(o?.spendable_usd);
+  if (balance === null || spendable === null) return null;
+  return { balance, guarantee: usdOrNull(o?.guarantee_usd) ?? 0, spendable, low: o?.low_balance === true };
+}
 
 /** X-Freda-Signature: sha256=<hex HMAC-SHA256 of the RAW body with the whsec_ secret> */
 export function verifyWebhookSignature(rawBody: string, header: string | null, secret: string): boolean {

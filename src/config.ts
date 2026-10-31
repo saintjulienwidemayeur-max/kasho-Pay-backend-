@@ -13,6 +13,10 @@ export function getConfig() {
     minCardFundUsd: num("MIN_CARD_FUND_USD", 1),
     // First load put on a card when it is created (the "prefund")
     minCardPrefundUsd: num("MIN_CARD_PREFUND_USD", 2),
+    // Freda keeps this when a card is closed (docs: 0.50 USD, never more than what is left on the card).
+    cardClosureFeeUsd: num("CARD_CLOSURE_FEE_USD", 0.5),
+    // Warn in the logs when the cards Master Wallet has less than this spendable (guarantee deposit excluded)
+    masterWalletAlertUsd: num("MASTER_WALLET_ALERT_USD", 25),
     // Rolling 24h caps per user (0 disables a cap)
     dailyTransferLimitUsd: num("DAILY_TRANSFER_LIMIT_USD", 2000),
     dailyWithdrawLimitUsd: num("DAILY_WITHDRAW_LIMIT_USD", 2000),
@@ -22,6 +26,11 @@ export function getConfig() {
 
 export function round2(n: number): number {
   return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+/** Closing fee for a card with `balance` left: the flat fee, but never more than what is left on the card. */
+export function closureFee(balance: number): number {
+  return round2(Math.min(getConfig().cardClosureFeeUsd, Math.max(0, balance)));
 }
 
 // Haiti numbers: accepts "+509 3700 1234", "37001234", "50937001234" -> "50937001234"
