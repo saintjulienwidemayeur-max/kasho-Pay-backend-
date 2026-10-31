@@ -10,7 +10,7 @@ const LINK_KEY = /verif.*(link|url)|(link|url).*verif|kyc.*(link|url)/i; // veri
 const EXPIRES_KEY = /expire/i;
 const REASON_KEYS = ["failure_reason", "failureReason", "status_reason", "reason"];
 /** The refusals that mean "the holder has to complete the identity verification first" (Freda's French and English wording). */
-const IDENTITY_TEXT = /v[ée]rification d['’]identit[ée]|identity verification|verify (your|the holder'?s?) identity|face verification|v[ée]rification faciale/i;
+const IDENTITY_TEXT = /restart_verification|d[ée]j[àa] [ée]t[ée] refus[ée]|document.*(declined|refus)|v[ée]rification d['’]identit[ée]|identity verification|verify (your|the holder'?s?) identity|face verification|v[ée]rification faciale/i;
 
 const MAX_DEPTH = 3;
 

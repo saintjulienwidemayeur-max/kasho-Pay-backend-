@@ -701,7 +701,13 @@ export const handlers: Record<string, Handler> = {
           // The card provider has not verified this holder's identity yet (Freda: "pas Tier 2"). Sending the holder again with a
           // legible ID restarts the verification; after a minute the card is asked for once more.
           if (!(first instanceof FredaError && (first.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(first.message)))) throw first;
-          if (forced || !(await resendHolder(holder, holderFredaId!, c))) throw first; // a given holder id is never re-sent
+          // A holder id that was given has no stored row: its details come from the profile (the e-mail is the customer's real one).
+          const sendHolder = holder ?? {
+            first_name: profile?.first_name, last_name: profile?.last_name, email: c.email, dob: profile?.date_of_birth, country: profile?.country,
+            id_number: profile?.id_number, phone_code: profile?.phone_code, phone_number: profile?.phone_number, address_street: profile?.address_street,
+            address_city: profile?.address_city, address_state: profile?.address_state, address_postal_code: profile?.address_postal_code,
+          };
+          if (!(await resendHolder(sendHolder, holderFredaId!, c))) throw first;
           // The new verification can take a few minutes: wait until GET /v1/cards/holders/:id says ready_for_cards (at most ~4 minutes).
           for (let i = 0; i < 16; i++) {
             await new Promise((r) => setTimeout(r, 15_000));
