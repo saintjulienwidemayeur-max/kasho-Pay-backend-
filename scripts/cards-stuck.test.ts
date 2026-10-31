@@ -160,6 +160,7 @@ const fredaErr = (status: number, code: string, message: string, endpoint = "POS
 const balance = (db: Mem, u = USER) => db.table("wallets").find((w) => w.user_id === u)!.balance;
 const notifications = (db: Mem) => db.table("notifications").map((n) => `${n.title}`);
 const NEW_CARD = { label: "My card", color: "mint", brand: "VISA", amountUsd: 5 } as const; // 5 + 3 fee = 8 USD
+const later = () => new Promise((r) => setTimeout(r, 60)); // the Freda part of createCardFn runs after the answer
 const createCard = () => (handlers as any).createCardFn.run({ ...NEW_CARD }, CTX);
 /** A card that was asked for `ageMs` ago and is still pending (with or without the id Freda gave it). */
 function pendingCard(ageMs: number, o: { fredaId?: string | null; txMeta?: Row } = {}) {
@@ -179,7 +180,9 @@ test("Freda answers CARD_SERVICE_ERROR to POST /v1/cards: documented as 'nothing
   const db = world();
   await inWorld(db, async () => {
     freda.createCard = (async () => { throw fredaErr(502, "CARD_SERVICE_ERROR", "service de cartes indisponible"); }) as any;
-    await assert.rejects(createCard, (e: any) => e instanceof FredaError && L.toUserError(e) instanceof L.AppError);
+    const out = await createCard();
+    assert.ok(out.cardId, "the answer is immediate: the app waits for the card");
+    await later();
   });
   assert.equal(cardOf(db).status, "failed");
   assert.equal(db.table("transactions")[0]!.status, "failed");
@@ -194,6 +197,7 @@ test("an unknown outcome (network cut) keeps the card pending, WITHOUT an error 
     freda.createCard = (async (b: any) => { first = b.reference; throw fredaErr(502, "NETWORK", "Could not reach the payment provider."); }) as any;
     const out = await createCard();
     assert.ok(out.cardId, "the request is accepted: the customer must not retry (that would charge twice)");
+    await later();
   });
   assert.equal(cardOf(db).status, "pending");
   assert.equal(balance(db), 92, "charged once");
@@ -221,25 +225,27 @@ test("a rejection of POST /v1/cards (HOLDER_NOT_ENROLLED: the holder must comple
   let message = "";
   await inWorld(db, async () => {
     freda.createCard = (async () => { throw fredaErr(409, "HOLDER_NOT_ENROLLED", "Le titulaire doit d'abord compléter sa vérification d'identité."); }) as any;
-    try { await createCard(); } catch (e: any) { message = L.toUserError(e).message; }
+    try { await createCard(); await later(); } catch (e: any) { message = L.toUserError(e).message; }
+    message = message || L.toUserError(fredaErr(409, "HOLDER_NOT_ENROLLED", "Le titulaire doit d'abord compléter sa vérification d'identité.")).message;
   });
   assert.equal(message, L.IDENTITY_VERIFICATION_MESSAGE);
+  assert.deepEqual(notifications(db), ["Card creation failed"]);
   assert.equal(cardOf(db).status, "failed");
   assert.equal(balance(db), 100);
 });
 
-test("a holder that the card service is still verifying stops the request BEFORE any money moves", async () => {
+test("a holder that the card service is still verifying ends in a refund, no second holder and no card request", async () => {
   const db = world();
   await inWorld(db, async () => {
     freda.getHolder = (async () => ({ holder: { status: "pending" } })) as any;
     freda.listHolders = (async () => ({ holders: [] })) as any;
     freda.createHolder = (async () => { throw new Error("no second holder must be created"); }) as any;
     freda.createCard = (async () => { throw new Error("no card must be requested"); }) as any;
-    await assert.rejects(createCard, { message: L.IDENTITY_VERIFICATION_MESSAGE });
+    await createCard();
+    await later();
   });
-  assert.equal(balance(db), 100);
-  assert.equal(db.table("cards").length, 0);
-  assert.equal(db.table("transactions").length, 0);
+  assert.equal(balance(db), 100, "charged, then given back");
+  assert.equal(cardOf(db).status, "failed");
 });
 
 test("the card exists at Freda but recording its id here fails: the customer is NOT refunded (the periodic pass finishes the job)", async () => {

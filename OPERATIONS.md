@@ -54,3 +54,6 @@ The admin is a separate site (repo `admin-page-kasho-pay`, for example at `https
 7. The Overview shows the real Master Wallet and Gateway balances once `FREDA_API_KEY` is set (a live key shows live balances). The Fees tab edits what customers pay; the Cards tab lists every card issued.
 8. Everything done on the site is in `admin_audit` (Audit log tab). Adding or removing money there changes the Kasho Pay wallet only; it does not move money at Freda, so keep Freda funded for what customers hold.
 9. Optional: `ADMIN_MAX_ADJUST_USD` (default 10000) caps one add / remove money adjustment. The admin site signs out after 20 minutes without activity and when the browser is closed.
+
+## 9. Render does not sleep
+The server asks for its own `/health` every 5 minutes (`RENDER_EXTERNAL_URL`, set by Render; `KEEP_ALIVE_URL` overrides, `KEEP_ALIVE=false` turns it off). It cannot wake itself once asleep: also add a free external ping (UptimeRobot, 5 minutes, `https://<backend>/health`).
