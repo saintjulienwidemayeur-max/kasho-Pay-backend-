@@ -125,6 +125,17 @@ async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
 }
 
 
+
+/** Holder ids that are forced for a customer (by full name), on top of the HOLDER_OVERRIDES env var: {"first last": "holder id"}. */
+const HOLDER_OVERRIDES: Record<string, string> = { "rosaldo stephene": "e1698438-b83d-4238-8268-2182a3074399" };
+function holderOverride(profile: any): string | undefined {
+  const norm = (v: unknown) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase().replace(/\s+/g, " ");
+  let env: Record<string, string> = {};
+  try { env = JSON.parse(process.env["HOLDER_OVERRIDES"] ?? "{}"); } catch { /* ignore a bad value */ }
+  const name = norm(`${profile?.first_name ?? ""} ${profile?.last_name ?? ""}`);
+  const id = { ...HOLDER_OVERRIDES, ...Object.fromEntries(Object.entries(env).map(([k, v]) => [norm(k), v])) }[name];
+  return typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : undefined;
+}
 const lastReverify = new Map<string, number>();
 /** Sends the holder again (same e-mail) with fresh, whole ID photos: this restarts the identity verification at the card provider. At most once per 10 minutes. */
 async function resendHolder(holder: any, holderFredaId: string, c: Ctx): Promise<boolean> {
@@ -578,9 +589,15 @@ export const handlers: Record<string, Handler> = {
       const finish = async (): Promise<void> => {
       const mode = fredaMode();
       // The customer never picks a card holder: the latest one for this account is used, or one is created automatically.
+      // A holder id that was given for this customer is used as it is: the holder already exists, no holder is created or checked.
+      const forced = holderOverride(profile);
+      let holder: any;
+      let holderFredaId: string | undefined = forced;
+      if (forced) console.log("[holder] using the holder id given for this customer:", forced);
+      if (!forced) {
       const { data: holders } = await L.db.from("card_holders").select("*").eq("user_id", c.userId).eq("mode", mode)
         .order("created_at", { ascending: false }).limit(1);
-      let holder = holders?.[0];
+      holder = holders?.[0];
       if (!holder) {
         // No holder yet: create it automatically from the verified profile, sending everything Freda requires.
         const merged = {
@@ -608,7 +625,6 @@ export const handlers: Record<string, Handler> = {
       //  1. the id stored on our holder row (GET /v1/cards/holders/:id), if it is still enrolled;
       //  2. the holders list (same e-mail or ID number, status enrolled);
       //  3. POST /v1/cards/holders again: no duplicate is created, Freda answers 200 `already_existed: true` with the id.
-      let holderFredaId: string | undefined;
       {
         const idNumber = decryptField(holder.id_number);
         let holderPending = false; // the card service has not finished verifying this holder's identity
@@ -670,8 +686,9 @@ export const handlers: Record<string, Handler> = {
       }
 
 
+      }
       // Always send the exact holder_id of THIS user's enrolled holder (the account default may belong to another user).
-      await ensureHolderReady(holder, holderFredaId, c);
+      if (!forced) await ensureHolderReady(holder, holderFredaId!, c);
       await L.mergeTxMeta(await L.getTx(txId), { holder_id: holderFredaId });
       const cardReq = { reference, kind: "individual" as const, brand: d.brand, amount, holder_id: holderFredaId };
       let res: any;
@@ -682,11 +699,11 @@ export const handlers: Record<string, Handler> = {
           // The card provider has not verified this holder's identity yet (Freda: "pas Tier 2"). Sending the holder again with a
           // legible ID restarts the verification; after a minute the card is asked for once more.
           if (!(first instanceof FredaError && (first.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(first.message)))) throw first;
-          if (!(await resendHolder(holder, holderFredaId, c))) throw first;
+          if (forced || !(await resendHolder(holder, holderFredaId!, c))) throw first; // a given holder id is never re-sent
           // The new verification can take a few minutes: wait until GET /v1/cards/holders/:id says ready_for_cards (at most ~4 minutes).
           for (let i = 0; i < 16; i++) {
             await new Promise((r) => setTimeout(r, 15_000));
-            const g: any = await freda.getHolder(holderFredaId).catch(() => null);
+            const g: any = await freda.getHolder(holderFredaId!).catch(() => null);
             const v = (g?.holder ?? g)?.verification;
             console.log("[holder] waiting for the verification:", JSON.stringify(v ?? null).slice(0, 160));
             if (v?.ready_for_cards === true || (v === undefined && i >= 3)) break;
