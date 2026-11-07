@@ -17,6 +17,9 @@ export const STEP_UP: Record<string, { field: string; strip: boolean }> = {
   // Moving customer money and suspending customers: password again, every time.
   adminAdjustBalance: { field: "confirmPassword", strip: true },
   adminSetUserBlocked: { field: "confirmPassword", strip: true },
+  // The exchange rate prices every top-up and withdrawal; a new administrator can move customer money: password again.
+  adminSetRate: { field: "confirmPassword", strip: true },
+  adminCreateAdmin: { field: "confirmPassword", strip: true },
 };
 
 /**
@@ -32,6 +35,7 @@ export const MFA_ENDPOINTS: ReadonlySet<string> = new Set([
   // admin panel (adminStatus is not here on purpose: the page uses it to explain what is missing before 2FA is set up)
   "adminOverview", "adminFredaFunds", "adminListUsers", "adminGetUser", "adminListCards", "adminGetCard",
   "adminAdjustBalance", "adminSetUserBlocked", "adminListTransactions", "adminListSupport", "adminListAudit",
+  "adminGetRate", "adminSetRate", "adminListAdmins", "adminCreateAdmin",
 ]);
 
 /** Defaults to TRUE: only an explicit "false" turns the wide enforcement off. */

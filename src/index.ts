@@ -8,6 +8,7 @@ import { freda, fredaConfigured, fredaMode, readMasterWallet, verifyWebhookSigna
 import { getConfig } from "./config.js";
 import { isSuspended } from "./security.js";
 import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
+import { loadRate } from "./admin.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { initPush, runMorningGreetings } from "./push.js";
@@ -160,6 +161,8 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   adminSetUserBlocked: { windowMs: MIN, max: 10 },
   adminOverview: { windowMs: MIN, max: 30 },
   adminFredaFunds: { windowMs: MIN, max: 20 },
+  adminSetRate: { windowMs: MIN, max: 5 },
+  adminCreateAdmin: { windowMs: HOUR, max: 10 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();
 for (const [name, l] of Object.entries(endpointLimits)) {
@@ -374,6 +377,8 @@ app.listen(port, () => {
     for (const i of list ?? []) if (i.family === "IPv4" && !i.internal) console.log(`  On your network: http://${i.address}:${port}/health`);
   }
   setInterval(reconcile, 30_000);
+  void loadRate();
+  setInterval(() => { void loadRate(); }, 30_000).unref(); // the exchange rate an administrator sets (also picked up by other instances)
   // Render's free plan puts a service to sleep after ~15 minutes without a request from outside. While it is awake it asks for its own
   // public address every 5 minutes (Render sets RENDER_EXTERNAL_URL; KEEP_ALIVE_URL overrides it, KEEP_ALIVE=false turns it off).
   const keepAlive = (process.env["KEEP_ALIVE_URL"] ?? process.env["RENDER_EXTERNAL_URL"] ?? "").replace(/\/+$/, "");

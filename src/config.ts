@@ -5,9 +5,20 @@ function num(name: string, fallback: number): number {
   return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
+/** The HTG-per-USD rate set from the admin site (app_settings.htg_per_usd). Null = use HTG_PER_USD from the environment. */
+export const RATE_MIN = 10;
+export const RATE_MAX = 1000;
+let rateOverride: number | null = null;
+export function setRateOverride(v: number | null): void {
+  rateOverride = typeof v === "number" && Number.isFinite(v) && v >= RATE_MIN && v <= RATE_MAX ? Math.round(v * 100) / 100 : null;
+}
+export const getRateOverride = (): number | null => rateOverride;
+/** The rate from the environment (what is used until an administrator sets one). */
+export const envRate = (): number => num("HTG_PER_USD", 131) || 131;
+
 export function getConfig() {
   return {
-    htgPerUsd: num("HTG_PER_USD", 131) || 131,
+    htgPerUsd: rateOverride ?? envRate(),
     minDepositUsd: num("MIN_DEPOSIT_USD", 1),
     minWithdrawUsd: num("MIN_WITHDRAW_USD", 1),
     minCardFundUsd: num("MIN_CARD_FUND_USD", 1),

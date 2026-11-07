@@ -208,3 +208,17 @@ test("Didit out-of-credits refusals are recognised", async () => {
   assert.equal(isDiditNoCredits(400, "Invalid workflow"), false);
   assert.equal(isDiditNoCredits(500, "credits"), false);
 });
+
+test("the exchange rate set by an administrator wins over HTG_PER_USD, inside its bounds", async () => {
+  const C = await import("../src/config.js");
+  const env = C.envRate();
+  assert.equal(C.getConfig().htgPerUsd, env);
+  C.setRateOverride(140.256);
+  assert.equal(C.getConfig().htgPerUsd, 140.26);
+  C.setRateOverride(5); // below the minimum: ignored, back to the environment rate
+  assert.equal(C.getConfig().htgPerUsd, env);
+  C.setRateOverride(5000);
+  assert.equal(C.getConfig().htgPerUsd, env);
+  C.setRateOverride(null);
+  assert.equal(C.getConfig().htgPerUsd, env);
+});

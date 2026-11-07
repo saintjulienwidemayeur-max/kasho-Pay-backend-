@@ -6,9 +6,12 @@
 import { z } from "zod";
 import * as L from "./ledger.js";
 import { describeFredaError, freda, fredaConfigured, fredaMode, readFredaBalances, readMasterWallet, type MasterWallet } from "./freda.js";
-import { getConfig, round2 } from "./config.js";
+import { RATE_MAX, RATE_MIN, envRate, getConfig, getRateOverride, round2, setRateOverride } from "./config.js";
+import { supabaseAdmin } from "./supabase.js";
 import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import type { Ctx, Handler } from "./types.js";
+
+const hasTotp = (u: any): boolean => (u?.factors ?? []).some((f: any) => f?.factor_type === "totp" && f?.status === "verified");
 
 export const ADMIN_MFA_MESSAGE = "Turn on two-factor authentication to use the admin tools.";
 const NEEDS_MIGRATION = "The admin tables are not installed yet. Run supabase/migrations/20261101000000_admin_panel.sql in the Supabase SQL editor.";
@@ -54,6 +57,26 @@ async function audit(c: Ctx, action: string, details: Record<string, unknown>, t
     admin_id: c.userId, admin_email: c.email || null, action, target_user: target ?? null, details, ip: c.ip,
   });
   if (error && !missingAdminObject(error)) console.error("[admin-audit]", error.message);
+}
+
+/** Reads the exchange rate an administrator set (app_settings.htg_per_usd) into memory. Without a row, or before the migration, the environment rate stays. */
+export async function loadRate(): Promise<void> {
+  try {
+    const { data, error } = await L.db.from("app_settings").select("value").eq("key", "htg_per_usd").maybeSingle();
+    if (error) return;
+    const v = Number((data?.value as any)?.rate ?? data?.value);
+    setRateOverride(Number.isFinite(v) ? v : null);
+  } catch { /* keep the current rate */ }
+}
+
+async function rateInfo() {
+  const { data } = await L.db.from("app_settings").select("value, updated_at, updated_by").eq("key", "htg_per_usd").maybeSingle();
+  let by: string | null = null;
+  if (data?.updated_by) by = (await supabaseAdmin.auth.admin.getUserById(String(data.updated_by)).catch(() => null))?.data?.user?.email ?? null;
+  return {
+    rate: getConfig().htgPerUsd, source: (getRateOverride() === null ? "environment" : "admin") as "admin" | "environment", envRate: envRate(),
+    min: RATE_MIN, max: RATE_MAX, updatedAt: (data?.updated_at as string | undefined) ?? null, updatedBy: by,
+  };
 }
 
 const money = (n: number) => `$${Number(n).toFixed(2)}`;
@@ -252,6 +275,95 @@ export const adminHandlers: Record<string, Handler> = {
       await L.db.from("activity_log").insert({ user_id: c.userId, event: "Fee rule deleted", detail: String(data[0].operation), ip: c.ip, user_agent: c.ua });
       await audit(c, "fee_rule_deleted", { operation: String(data[0].operation) });
       return { ok: true };
+    },
+  },
+
+  // ---------------------------------------------------------------- exchange rate (HTG per 1 USD)
+  adminGetRate: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      await requireAdmin(c);
+      await loadRate();
+      return rateInfo();
+    },
+  },
+
+  /** Sets the rate used for every top-up and withdrawal from now on (operations already started keep the rate saved on them). */
+  adminSetRate: {
+    schema: z.object({ rate: z.number().min(RATE_MIN).max(RATE_MAX), confirmPassword: z.string().optional() }),
+    run: async (d, c) => {
+      await requireAdmin(c, "super");
+      const rate = round2(d.rate);
+      const before = getConfig().htgPerUsd;
+      const { error } = await L.db.from("app_settings").upsert({ key: "htg_per_usd", value: { rate }, updated_at: new Date().toISOString(), updated_by: c.userId });
+      if (error) {
+        if (missingAdminObject(error)) throw new L.AppError(NEEDS_MIGRATION);
+        throw error;
+      }
+      setRateOverride(rate);
+      await L.db.from("activity_log").insert({ user_id: c.userId, event: "Exchange rate changed", detail: `${before} -> ${rate} HTG per USD`, ip: c.ip, user_agent: c.ua });
+      await audit(c, "rate_changed", { from: before, to: rate });
+      return rateInfo();
+    },
+  },
+
+  // ---------------------------------------------------------------- administrators (super only)
+  adminListAdmins: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      await requireAdmin(c, "super");
+      const rows = (await q<any[]>(L.db.from("admins").select("*").order("created_at"))) ?? [];
+      const items = await Promise.all(rows.map(async (r) => {
+        const u = (await supabaseAdmin.auth.admin.getUserById(String(r.user_id)).catch(() => null))?.data?.user as any;
+        const { data: p } = await L.db.from("profiles").select("first_name, last_name, display_name").eq("id", r.user_id).maybeSingle();
+        return {
+          userId: String(r.user_id), email: String(u?.email ?? ""), name: String(p?.display_name || `${p?.first_name ?? ""} ${p?.last_name ?? ""}`.trim() || ""),
+          role: (r.role === "super" ? "super" : "admin") as AdminRole, createdAt: String(r.created_at ?? ""), lastSignInAt: (u?.last_sign_in_at as string | undefined) ?? null,
+          has2fa: hasTotp(u), you: String(r.user_id) === c.userId,
+        };
+      }));
+      return { items };
+    },
+  },
+
+  /**
+   * Creates a new account and makes it an administrator ('admin' or 'super'). The new person signs in with the password given here,
+   * is asked to set up 2FA at once (the site refuses everything without it) and should change that password in "My account".
+   */
+  adminCreateAdmin: {
+    schema: z.object({
+      email: z.string().trim().toLowerCase().email().max(120),
+      password: z.string().min(12).max(72),
+      role: z.enum(["admin", "super"]),
+      firstName: z.string().trim().max(60).optional(),
+      lastName: z.string().trim().max(60).optional(),
+      confirmPassword: z.string().optional(),
+    }),
+    run: async (d, c) => {
+      await requireAdmin(c, "super");
+      if (d.password.toLowerCase().includes(d.email.split("@")[0]!)) throw new L.AppError("The password must not contain the e-mail address.");
+      const { data: created, error } = await supabaseAdmin.auth.admin.createUser({
+        email: d.email, password: d.password, email_confirm: true,
+        user_metadata: { first_name: d.firstName ?? "", last_name: d.lastName ?? "" },
+      });
+      if (error || !created?.user) {
+        const m = String(error?.message ?? "");
+        if (/already|registered|exists/i.test(m)) throw new L.AppError("An account with this e-mail already exists. Use another e-mail.");
+        if (/password/i.test(m)) throw new L.AppError("This password is refused. Use a longer, harder one.");
+        console.error("[admin] create admin:", m);
+        throw new L.AppError("Could not create this administrator. Try again.");
+      }
+      const id = created.user.id;
+      const { error: insErr } = await L.db.from("admins").insert({ user_id: id, role: d.role });
+      if (insErr) {
+        await supabaseAdmin.auth.admin.deleteUser(id).catch(() => undefined); // never leave an account without its admin row
+        if (missingAdminObject(insErr)) throw new L.AppError(NEEDS_MIGRATION);
+        console.error("[admin] create admin row:", insErr.message);
+        throw new L.AppError("Could not create this administrator. Try again.");
+      }
+      await L.db.from("activity_log").insert({ user_id: c.userId, event: "Administrator created", detail: `${d.email} (${d.role})`, ip: c.ip, user_agent: c.ua });
+      await audit(c, "admin_created", { email: d.email, role: d.role }, id);
+      return { userId: id, email: d.email, role: d.role as AdminRole };
     },
   },
 
