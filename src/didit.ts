@@ -11,6 +11,11 @@ export class DiditError extends Error {
   }
 }
 
+/** True when Didit refuses a request because the account has no credits left ("You don't have enough credits ... top up"). */
+export function isDiditNoCredits(status: number, message: unknown): boolean {
+  return (status === 400 || status === 402 || status === 403) && /credit/i.test(String(message ?? ""));
+}
+
 const base = () => (process.env["DIDIT_API_BASE"] ?? "https://verification.didit.me").replace(/\/+$/, "");
 
 export function diditConfigured(): boolean {
@@ -38,7 +43,10 @@ async function call(method: "GET" | "POST", path: string, body?: unknown): Promi
   try { json = text ? JSON.parse(text) : null; } catch { /* not json */ }
   if (!res.ok) {
     console.error("[didit]", res.status, path); // status only: the body can hold identity data
-    throw new DiditError(res.status, json?.detail ?? json?.message ?? "Verification service error.");
+    const msg = json?.detail ?? json?.message ?? "Verification service error.";
+    // Out of credits: every new identity verification fails until the account is topped up. Say it loudly (like [master-wallet] LOW).
+    if (isDiditNoCredits(res.status, msg)) console.error("[didit] NO_CREDITS: the Didit account has no credits left, new KYC verifications are refused. Top up at https://business.didit.me");
+    throw new DiditError(res.status, msg);
   }
   return json;
 }

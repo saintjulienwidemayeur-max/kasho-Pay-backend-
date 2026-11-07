@@ -201,3 +201,10 @@ test("card_fund without a flag (server crashed after the debit): replayed only a
     assert.deepEqual(args, ["card_9", 20, "KP-1"]);
   });
 });
+
+test("Didit out-of-credits refusals are recognised", async () => {
+  const { isDiditNoCredits } = await import("../src/didit.js");
+  assert.equal(isDiditNoCredits(400, "You don't have enough credits to perform this request. Please top up at https://business.didit.me"), true);
+  assert.equal(isDiditNoCredits(400, "Invalid workflow"), false);
+  assert.equal(isDiditNoCredits(500, "credits"), false);
+});
