@@ -117,10 +117,12 @@ const SAMPLES: Record<string, string[]> = {
   "Password changed": ["Your password was changed. If this was not you, contact support now."],
   "Money received": ["Marie sent you $12.00"],
   "Money sent": ["$12.00 sent to Jean", "$12.00 sent to Jean (fee $0.50)"],
+  "Reply from Kasho Pay support": ["Your identity check works again, please try once more."],
   "Dispute submitted": ["DSP-12345 for Money sent"],
   "Balance adjusted": ["$25.00 was added to your wallet by Kasho Pay.", "$10.50 was removed from your wallet by Kasho Pay."],
 };
 
+const FREE_TEXT = new Set(["Reply from Kasho Pay support"]);
 test("every notify() call in src has a French translation", () => {
   let calls = 0;
   const titles = new Set<string>();
@@ -137,6 +139,11 @@ test("every notify() call in src has a French translation", () => {
     assert.ok(SAMPLES[t], `add a sample for notify title "${t}" in scripts/push.test.ts`);
     for (const body of SAMPLES[t]!) {
       const fr = P.pushText(t, body, "fr");
+      if (FREE_TEXT.has(t)) { // a reply written by an administrator: the body is never translated, only the title
+        assert.notEqual(fr.title, t, `French title missing for "${t}"`);
+        assert.deepEqual(fr, { title: fr.title, body });
+        continue;
+      }
       assert.notEqual(fr.title, t, `French title missing for "${t}"`);
       assert.notEqual(fr.body, body, `French body pattern missing for "${t}": ${body}`);
       assert.deepEqual(P.pushText(t, body, "en"), { title: t, body });

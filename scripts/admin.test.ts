@@ -90,7 +90,7 @@ test("adminStatus works without 2FA so the page can explain what is missing", as
 
 test("every admin endpoint asks for 2FA, and the money ones for the password again", () => {
   const names = Object.keys(A.adminHandlers);
-  assert.equal(names.length, 19);
+  assert.equal(names.length, 20);
   for (const n of names) if (n !== "adminStatus") assert.ok(MFA_ENDPOINTS.has(n), `${n} must be in MFA_ENDPOINTS`);
   assert.ok(!MFA_ENDPOINTS.has("adminStatus"));
   for (const n of ["adminAdjustBalance", "adminSetUserBlocked", "adminSaveFee", "adminDeleteFee", "adminSetRate", "adminCreateAdmin"]) {
@@ -426,4 +426,17 @@ test("by default the admin site does not ask for 2FA (ADMIN_REQUIRE_2FA unset or
   } finally {
     if (before === undefined) delete process.env["ADMIN_REQUIRE_2FA"]; else process.env["ADMIN_REQUIRE_2FA"] = before;
   }
+});
+
+test("a support reply is saved on the message and the customer is notified; a missing message is explained", async () => {
+  const f = fakeDb({ one: { admins: SUPER_ROW, support_messages: { id: "m1", user_id: "u1" } } });
+  const out = await withFake(f, () => A.adminHandlers.adminReplySupport.run({ kind: "message", id: "11111111-1111-4111-8111-111111111111", reply: "Your KYC works again." }, SUPER));
+  assert.equal(out.ok, true);
+  const upd = f.calls.find((c) => c.table === "support_messages" && c.method === "update")!.args[0];
+  assert.equal(upd.reply, "Your KYC works again.");
+  assert.equal(upd.replied_by, "admin-1");
+  assert.deepEqual(inserts(f, "notifications").map((n) => [n.user_id, n.title, n.body]), [["u1", "Reply from Kasho Pay support", "Your KYC works again."]]);
+  assert.equal(inserts(f, "admin_audit")[0].action, "support_replied");
+  const none = fakeDb({ one: { admins: SUPER_ROW } });
+  await assert.rejects(() => withFake(none, () => A.adminHandlers.adminReplySupport.run({ kind: "dispute", id: "11111111-1111-4111-8111-111111111111", reply: "Hello" }, SUPER)), { message: "This message was not found." });
 });

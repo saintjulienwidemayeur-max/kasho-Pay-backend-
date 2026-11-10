@@ -162,6 +162,7 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   adminOverview: { windowMs: MIN, max: 30 },
   adminFredaFunds: { windowMs: MIN, max: 20 },
   adminSetRate: { windowMs: MIN, max: 5 },
+  adminReplySupport: { windowMs: MIN, max: 30 },
   adminCreateAdmin: { windowMs: HOUR, max: 10 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();

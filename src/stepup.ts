@@ -35,7 +35,7 @@ export const MFA_ENDPOINTS: ReadonlySet<string> = new Set([
   // admin panel (adminStatus is not here on purpose: the page uses it to explain what is missing before 2FA is set up)
   "adminOverview", "adminFredaFunds", "adminListUsers", "adminGetUser", "adminListCards", "adminGetCard",
   "adminAdjustBalance", "adminSetUserBlocked", "adminListTransactions", "adminListSupport", "adminListAudit",
-  "adminGetRate", "adminSetRate", "adminListAdmins", "adminCreateAdmin",
+  "adminGetRate", "adminSetRate", "adminListAdmins", "adminCreateAdmin", "adminReplySupport",
 ]);
 
 /** Defaults to TRUE: only an explicit "false" turns the wide enforcement off. */

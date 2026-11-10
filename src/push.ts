@@ -71,11 +71,13 @@ export function validTimeZone(tz: unknown): tz is string {
 }
 
 // ------------------------------------------------------------------ French texts for the (English) notify() messages
-type Rule = { title: string; fr: string; bodies: Array<[RegExp, (m: RegExpMatchArray) => string]> };
+type Rule = { title: string; fr: string; bodies: Array<[RegExp, (m: RegExpMatchArray) => string]>; freeText?: boolean };
 const AMT = "(\\$[\\d.,]+)";
 const exact = (s: string, fr: string): [RegExp, () => string] => [new RegExp(`^${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`), () => fr];
 
 export const PUSH_RULES: Rule[] = [
+  // The body is a reply an administrator wrote: it is sent as written, only the title is translated.
+  { title: "Reply from Kasho Pay support", fr: "Réponse du support Kasho Pay", bodies: [], freeText: true },
   { title: "Deposit not credited", fr: "Dépôt non crédité", bodies: [[
     /^We received (\S+) HTG instead of the (\S+) HTG you requested, so your wallet was not credited\. Our support team will contact you about the amount we received\.$/,
     (m) => `Nous avons reçu ${m[1]} HTG au lieu des ${m[2]} HTG demandés, votre portefeuille n'a donc pas été crédité. Notre équipe support vous contactera au sujet du montant reçu.`]] },
@@ -126,6 +128,7 @@ export function pushText(title: string, body: string, lang: string): { title: st
   if (lang !== "fr") return { title, body };
   const rule = PUSH_RULES.find((r) => r.title === title);
   if (!rule) return { title, body };
+  if (rule.freeText) return { title: rule.fr, body };
   for (const [re, build] of rule.bodies) {
     const m = body.match(re);
     if (m) return { title: rule.fr, body: build(m) };

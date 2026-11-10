@@ -17,6 +17,8 @@ const hasTotp = (u: any): boolean => (u?.factors ?? []).some((f: any) => f?.fact
 export const ADMIN_MFA_MESSAGE = "Turn on two-factor authentication to use the admin tools.";
 const NEEDS_MIGRATION = "The admin tables are not installed yet. Run supabase/migrations/20261101000000_admin_panel.sql in the Supabase SQL editor.";
 export type AdminRole = "super" | "admin";
+const REPLY_MIGRATION = "Replies are not installed yet. Run supabase/migrations/20261110000000_support_replies.sql in the Supabase SQL editor.";
+const REPLY_COLUMNS = /\breply\b|replied_(at|by)/i;
 
 /** Admin access needs a verified TOTP factor AND an aal2 session only when ADMIN_REQUIRE_2FA=true; by default it does not. */
 export function adminMfaOk(c: Pick<Ctx, "mfa" | "aal">): boolean {
@@ -606,15 +608,44 @@ export const adminHandlers: Record<string, Handler> = {
     schema: z.object({}).passthrough(),
     run: async (_d, c) => {
       await requireAdmin(c);
+      // The reply columns come from 20261110000000_support_replies.sql: until it is run, the lists still load, without replies.
+      const list = async (table: string, cols: string) => {
+        const withReply = await L.db.from(table).select(`${cols}, reply, replied_at`).order("created_at", { ascending: false }).limit(100);
+        if (!withReply.error) return (withReply.data ?? []) as any[];
+        if (!REPLY_COLUMNS.test(String(withReply.error.message ?? ""))) throw withReply.error;
+        return (await q<any[]>(L.db.from(table).select(cols).order("created_at", { ascending: false }).limit(100))) ?? [];
+      };
       const [disputes, messages] = await Promise.all([
-        q<any[]>(L.db.from("disputes").select("id, user_id, transaction_ref, title, amount, reason, note, reference, created_at").order("created_at", { ascending: false }).limit(100)),
-        q<any[]>(L.db.from("support_messages").select("id, user_id, email, message, created_at").order("created_at", { ascending: false }).limit(100)),
+        list("disputes", "id, user_id, transaction_ref, title, amount, reason, note, reference, created_at"),
+        list("support_messages", "id, user_id, email, message, created_at"),
       ]);
       const names = await namesFor([...(disputes ?? []), ...(messages ?? [])].map((r) => r.user_id));
       return {
         disputes: (disputes ?? []).map((r) => ({ ...r, amount: Number(r.amount), customer: names.get(r.user_id)?.name ?? "" })),
         messages: (messages ?? []).map((r) => ({ ...r, customer: names.get(r.user_id)?.name ?? "" })),
       };
+    },
+  },
+
+  /** Answers a customer's help message or dispute: the reply is saved on it and the customer is notified (in the app, and by push). */
+  adminReplySupport: {
+    schema: z.object({ kind: z.enum(["message", "dispute"]), id: uuid, reply: z.string().trim().min(2).max(2000) }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const table = d.kind === "message" ? "support_messages" : "disputes";
+      const { data: row, error: readErr } = await L.db.from(table).select("id, user_id").eq("id", d.id).maybeSingle();
+      if (readErr) throw readErr;
+      if (!row) throw new L.AppError("This message was not found.");
+      const repliedAt = new Date().toISOString();
+      const { error } = await L.db.from(table).update({ reply: d.reply, replied_at: repliedAt, replied_by: c.userId }).eq("id", d.id);
+      if (error) {
+        if (REPLY_COLUMNS.test(String(error.message ?? "")) || missingAdminObject(error)) throw new L.AppError(REPLY_MIGRATION);
+        throw error;
+      }
+      const to = String(row.user_id);
+      await L.notify(to, "Reply from Kasho Pay support", d.reply);
+      await audit(c, "support_replied", { kind: d.kind, id: d.id }, String(row.user_id));
+      return { ok: true as const, repliedAt };
     },
   },
 
