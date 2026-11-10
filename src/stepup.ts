@@ -43,6 +43,14 @@ export function enforceMfaAll(value: string | undefined = process.env["ENFORCE_M
   return String(value ?? "").trim().toLowerCase() !== "false";
 }
 
+/**
+ * The admin site does NOT ask for 2FA: it signs in with e-mail and password, and the password is asked again for every sensitive
+ * action. Set ADMIN_REQUIRE_2FA=true to bring the old rule back (a verified TOTP factor + an aal2 session for every admin endpoint).
+ */
+export function adminRequire2fa(value: string | undefined = process.env["ADMIN_REQUIRE_2FA"]): boolean {
+  return String(value ?? "").trim().toLowerCase() === "true";
+}
+
 export function mfaEndpointRequired(name: string, enforceAll = enforceMfaAll()): boolean {
   return enforceAll && MFA_ENDPOINTS.has(name);
 }

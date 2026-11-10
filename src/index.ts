@@ -7,7 +7,7 @@ import * as L from "./ledger.js";
 import { freda, fredaConfigured, fredaMode, readMasterWallet, verifyWebhookSignature } from "./freda.js";
 import { getConfig } from "./config.js";
 import { isSuspended } from "./security.js";
-import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
+import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, adminRequire2fa, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { loadRate } from "./admin.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
@@ -206,7 +206,10 @@ async function stepUp(req: AuthedRequest, res: Response, next: NextFunction) {
   const rule = Object.prototype.hasOwnProperty.call(STEP_UP, name) ? STEP_UP[name] : undefined;
   if (!rule && !mfaEndpointRequired(name)) return next();
   const ctx = req.ctx!;
-  if (mfaBlocked(!!req.mfaRequired, req.aal)) return res.status(403).json(MFA_REQUIRED_ERROR);
+  // The admin site does not ask for 2FA: its own endpoints (and what it calls, like changePassword) skip the 2FA check unless ADMIN_REQUIRE_2FA=true.
+  const origin = req.header("origin");
+  const adminSite = name.startsWith("admin") || (!!origin && adminOrigins.includes(origin));
+  if (mfaBlocked(!!req.mfaRequired, req.aal) && (adminRequire2fa() || !adminSite)) return res.status(403).json(MFA_REQUIRED_ERROR);
   if (!rule || !rule.field) return next(); // 2FA-only rule (card details): the card code is verified by the handler
   const pw = req.body?.[rule.field];
   if (typeof pw !== "string" || !pw || pw.length > 200) {

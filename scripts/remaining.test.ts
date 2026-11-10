@@ -13,11 +13,15 @@ const { enforceMfaAll, mfaBlocked, mfaEndpointRequired, MFA_REQUIRED_ERROR, MFA_
 const UNAVAILABLE = "This service is temporarily unavailable. Please try again later.";
 const quiet = <T>(fn: () => T): T => { const e = console.error; console.error = () => {}; try { return fn(); } finally { console.error = e; } };
 
-test("admin needs a verified TOTP factor and an aal2 session", () => {
-  assert.equal(adminMfaOk({ mfa: true, aal: "aal2" }), true);
-  assert.equal(adminMfaOk({ mfa: true, aal: "aal1" }), false);
-  assert.equal(adminMfaOk({ mfa: false, aal: "aal2" }), false);
-  assert.equal(adminMfaOk({}), false);
+test("with ADMIN_REQUIRE_2FA=true admin needs a verified TOTP factor and an aal2 session", () => {
+  const before = process.env["ADMIN_REQUIRE_2FA"];
+  process.env["ADMIN_REQUIRE_2FA"] = "true";
+  try {
+    assert.equal(adminMfaOk({ mfa: true, aal: "aal2" }), true);
+    assert.equal(adminMfaOk({ mfa: true, aal: "aal1" }), false);
+    assert.equal(adminMfaOk({ mfa: false, aal: "aal2" }), false);
+    assert.equal(adminMfaOk({}), false);
+  } finally { if (before === undefined) delete process.env["ADMIN_REQUIRE_2FA"]; else process.env["ADMIN_REQUIRE_2FA"] = before; }
   assert.equal(ADMIN_MFA_MESSAGE, "Turn on two-factor authentication to use the admin tools.");
 });
 

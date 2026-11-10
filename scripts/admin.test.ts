@@ -6,6 +6,8 @@ import { readFileSync } from "node:fs";
 process.env["SUPABASE_URL"] ??= "http://localhost:1"; // ledger.ts builds a client at import time; nothing is called
 process.env["SUPABASE_SERVICE_ROLE_KEY"] ??= "test-key";
 process.env["FREDA_API_KEY"] = "sk_test_unit";
+// These tests cover the strict rule (a verified 2FA factor + an aal2 session); the default (no 2FA on the admin site) has its own test below.
+process.env["ADMIN_REQUIRE_2FA"] = "true";
 const L: any = await import("../src/ledger.js");
 const A: any = await import("../src/admin.js");
 const { freda } = await import("../src/freda.js");
@@ -409,4 +411,19 @@ test("migration: admin tables are server-only, the audit log is append-only, mon
   assert.match(sql, /select balance into v_before from public\.wallets where user_id = p_user for update/);
   assert.match(sql, /if not p_credit and v_before < v_amount then raise exception 'INSUFFICIENT_FUNDS'/);
   assert.equal((sql.match(/security definer set search_path/g) ?? []).length, 3);
+});
+
+test("by default the admin site does not ask for 2FA (ADMIN_REQUIRE_2FA unset or false)", async () => {
+  const before = process.env["ADMIN_REQUIRE_2FA"];
+  try {
+    for (const v of [undefined, "", "false"]) {
+      if (v === undefined) delete process.env["ADMIN_REQUIRE_2FA"]; else process.env["ADMIN_REQUIRE_2FA"] = v;
+      assert.equal(A.adminMfaOk({ mfa: false, aal: "aal1" }), true, `value ${v}`);
+    }
+    process.env["ADMIN_REQUIRE_2FA"] = "true";
+    assert.equal(A.adminMfaOk({ mfa: false, aal: "aal1" }), false);
+    assert.equal(A.adminMfaOk({ mfa: true, aal: "aal2" }), true);
+  } finally {
+    if (before === undefined) delete process.env["ADMIN_REQUIRE_2FA"]; else process.env["ADMIN_REQUIRE_2FA"] = before;
+  }
 });

@@ -10,6 +10,7 @@ import { RATE_MAX, RATE_MIN, envRate, getConfig, getRateOverride, round2, setRat
 import { supabaseAdmin } from "./supabase.js";
 import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import type { Ctx, Handler } from "./types.js";
+import { adminRequire2fa } from "./stepup.js";
 
 const hasTotp = (u: any): boolean => (u?.factors ?? []).some((f: any) => f?.factor_type === "totp" && f?.status === "verified");
 
@@ -17,8 +18,9 @@ export const ADMIN_MFA_MESSAGE = "Turn on two-factor authentication to use the a
 const NEEDS_MIGRATION = "The admin tables are not installed yet. Run supabase/migrations/20261101000000_admin_panel.sql in the Supabase SQL editor.";
 export type AdminRole = "super" | "admin";
 
-/** Admin access also needs a verified TOTP factor AND an aal2 session (2FA code passed in this session). */
+/** Admin access needs a verified TOTP factor AND an aal2 session only when ADMIN_REQUIRE_2FA=true; by default it does not. */
 export function adminMfaOk(c: Pick<Ctx, "mfa" | "aal">): boolean {
+  if (!adminRequire2fa()) return true; // the admin site does not ask for 2FA (ADMIN_REQUIRE_2FA=true brings it back)
   return c.mfa === true && c.aal === "aal2";
 }
 
