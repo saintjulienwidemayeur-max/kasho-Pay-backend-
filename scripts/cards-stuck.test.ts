@@ -150,13 +150,13 @@ function world(extra: Record<string, Row[]> = {}, hooks: Parameters<typeof memDb
   }, hooks);
 }
 
-const saved = { from: L.db.from, rpc: L.db.rpc, createCard: freda.createCard, getCard: freda.getCard, getHolder: freda.getHolder, createHolder: freda.createHolder, listHolders: freda.listHolders };
+const saved = { from: L.db.from, rpc: L.db.rpc, createCard: freda.createCard, getCard: freda.getCard, getHolder: freda.getHolder, createHolder: freda.createHolder, listHolders: freda.listHolders, restartHolderVerification: freda.restartHolderVerification };
 async function inWorld<T>(db: Mem, fn: () => Promise<T>): Promise<T> {
   L.db.from = db.from; L.db.rpc = db.rpc;
   freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
   try { return await quiet(fn); } finally {
     L.db.from = saved.from; L.db.rpc = saved.rpc;
-    Object.assign(freda, { createCard: saved.createCard, getCard: saved.getCard, getHolder: saved.getHolder, createHolder: saved.createHolder, listHolders: saved.listHolders });
+    Object.assign(freda, { createCard: saved.createCard, getCard: saved.getCard, getHolder: saved.getHolder, createHolder: saved.createHolder, listHolders: saved.listHolders, restartHolderVerification: saved.restartHolderVerification });
   }
 }
 const fredaErr = (status: number, code: string, message: string, endpoint = "POST /v1/cards") => { const e = new FredaError(status, code, message); e.endpoint = endpoint; return e; };
@@ -472,7 +472,7 @@ test("after the KYC a new customer is registered with the front AND back of the 
     const info = await H.enrollHolder(USER, "kyc");
     assert.deepEqual([info.state, info.holderId], ["pending", "mpc_new"], "enrolled at Freda, but not accepted by the program yet");
     await H.refreshPendingHolders();
-    assert.equal(db.table("card_holders")[0]!.verification_status, "pending", "polling never makes it ready");
+    assert.equal(db.table("card_holders")[0]!.verification_status, "submitted", "polling never makes it ready");
     await H.handleHolderEvent("holder.verified", { id: "mpc_new" });
     assert.equal((await H.holderInfo(USER)).state, "ready");
   }));
@@ -486,30 +486,44 @@ test("after the KYC a new customer is registered with the front AND back of the 
   assert.deepEqual(notifications(db), ["Card profile verified"], "told once, when it became ready");
 });
 
-test("a customer who already had a holder is sent again with restart_verification (same e-mail, same id), never a second holder", async () => {
+test("a customer who already had a holder: the verification is restarted on /v1/cards/holder-profile (same e-mail, same id), never a second holder", async () => {
   const db = world({ card_holders: [holderRow({ verification_status: null, program_enrolled_at: null, last_attempt_at: null, checked_at: null })] });
-  const sent: any[] = [];
+  const restarted: any[] = [];
   await inWorld(db, () => withDeps({}, async () => {
-    freda.createHolder = (async (b: any) => { sent.push(b); return { id: "mpc_1", restarted: true, holder: { id: "mpc_1", status: "pending" } }; }) as any;
+    freda.createHolder = (async () => { throw new Error("/v1/cards/holders answers an existing e-mail as is: not used for a restart"); }) as any;
+    freda.restartHolderVerification = (async (b: any) => { restarted.push(b); return { id: "mpc_1", restarted: true, holder: { id: "mpc_1", status: "pending" } }; }) as any;
     freda.getHolder = (async () => ({ holder: { status: "pending" } })) as any;
     await H.enrollMissingHolders();
   }));
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].restart_verification, true);
+  assert.equal(restarted.length, 1);
+  assert.equal(restarted[0].identity.imageBackUrl, IDENTITY.imageBackUrl, "with the new photos, front and back");
   assert.equal(db.table("card_holders").length, 1, "the same row is kept");
-  assert.equal(db.table("card_holders")[0]!.verification_status, "pending");
+  assert.equal(db.table("card_holders")[0]!.verification_status, "submitted");
 });
 
 test("Freda answers with the holder that already existed (same e-mail) without verifying it: the verification is restarted", async () => {
   const db = world({ card_holders: [] });
-  const sent: any[] = [];
+  const calls: string[] = [];
   await inWorld(db, () => withDeps({}, async () => {
-    freda.createHolder = (async (b: any) => { sent.push(b); return { id: "mpc_9", already_existed: !b.restart_verification, holder: { id: "mpc_9", status: "enrolled" } }; }) as any;
+    freda.createHolder = (async () => { calls.push("holders"); return { id: "mpc_9", already_existed: true, holder: { id: "mpc_9", status: "enrolled" } }; }) as any;
+    freda.restartHolderVerification = (async () => { calls.push("holder-profile"); return { restarted: true }; }) as any;
     freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
     const info = await H.enrollHolder(USER, "backfill");
-    assert.equal(info.state, "pending");
+    assert.deepEqual([info.state, info.holderId], ["pending", "mpc_9"]);
   }));
-  assert.deepEqual(sent.map((b) => b.restart_verification ?? false), [false, true]);
+  assert.deepEqual(calls, ["holders", "holder-profile"]);
+});
+
+test("an e-mail already used by a holder (HOLDER_EMAIL_EXISTS): the verification of that holder is restarted", async () => {
+  const db = world({ card_holders: [] });
+  const calls: string[] = [];
+  await inWorld(db, () => withDeps({}, async () => {
+    freda.createHolder = (async () => { calls.push("holders"); throw fredaErr(409, "HOLDER_EMAIL_EXISTS", "email", "POST /v1/cards/holders"); }) as any;
+    freda.restartHolderVerification = (async () => { calls.push("holder-profile"); return { id: "mpc_7", restarted: true }; }) as any;
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+    assert.equal((await H.enrollHolder(USER, "kyc")).holderId, "mpc_7");
+  }));
+  assert.deepEqual(calls, ["holders", "holder-profile"]);
 });
 
 test("no holder is sent without the back of a national ID card, nor for an incomplete profile; a passport needs no back", async () => {
@@ -591,26 +605,29 @@ test("holder.verified that arrives before the holder id was saved is applied whe
   assert.deepEqual(notifications(db), ["Card profile verified"]);
 });
 
-test("holders registered before the webhooks were read, and holders whose decision never came, get a new verification", async () => {
-  const legacy = holderRow({ verification_status: "ready", last_attempt_at: iso(3_600_000) });
-  const db = world({ card_holders: [legacy] });
+test("holders written by earlier versions (ready without webhook, or a 'restart' that did nothing) and holders whose decision never came get a new verification", async () => {
+  const legacy = holderRow({ verification_status: "ready", last_attempt_at: iso(3_600_000), program_enrolled_at: iso(3_600_000) });
+  const noopRestart = holderRow({ id: "h2", user_id: OTHER, freda_holder_id: "mpc_2", email: "jean@example.com", verification_status: "pending", created_at: iso(86_400_000), program_enrolled_at: iso(3_600_000), last_attempt_at: iso(3_600_000) });
+  const db = world({ card_holders: [legacy, noopRestart] });
+  db.table("profiles").push({ ...db.table("profiles")[0]!, id: OTHER });
   const sent: any[] = [];
   await inWorld(db, () => withDeps({}, async () => {
-    freda.createHolder = (async (b: any) => { sent.push(b); return { id: "mpc_1", holder: { id: "mpc_1", status: "enrolled" } }; }) as any;
+    freda.createHolder = (async () => { throw new Error("must not be called"); }) as any;
+    freda.restartHolderVerification = (async (b: any) => { sent.push(b); return { restarted: true }; }) as any;
     freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
     await H.enrollMissingHolders();
-    await H.enrollMissingHolders(); // the second round does not send it again
+    await H.enrollMissingHolders(); // the second round does not send them again
   }));
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].restart_verification, true);
-  assert.equal(db.table("card_holders")[0]!.verification_status, "pending", "it waits for holder.verified again");
+  assert.equal(sent.length, 2);
+  assert.deepEqual(db.table("card_holders").map((r) => r.verification_status), ["submitted", "submitted"], "they wait for holder.verified again");
 
-  const waiting = world({ card_holders: [holderRow({ verification_status: "pending", program_enrolled_at: iso(7 * 3_600_000), last_attempt_at: iso(7 * 3_600_000) })] });
-  const fresh = world({ card_holders: [holderRow({ verification_status: "pending", program_enrolled_at: iso(3_600_000), last_attempt_at: iso(3_600_000) })] });
+  // a fresh registration of this version waits; one that waits for more than 6 hours is sent again
+  const waiting = world({ card_holders: [holderRow({ verification_status: "submitted", created_at: iso(7 * 3_600_000), program_enrolled_at: iso(7 * 3_600_000), last_attempt_at: iso(7 * 3_600_000) })] });
+  const fresh = world({ card_holders: [holderRow({ verification_status: "submitted", created_at: iso(3_600_000), program_enrolled_at: iso(3_600_000), last_attempt_at: iso(3_600_000) })] });
   let calls = 0;
   for (const db2 of [waiting, fresh]) {
     await inWorld(db2, () => withDeps({}, async () => {
-      freda.createHolder = (async () => { calls++; return { id: "mpc_1", holder: { status: "enrolled" } }; }) as any;
+      freda.restartHolderVerification = (async () => { calls++; return { restarted: true }; }) as any;
       freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
       await H.enrollMissingHolders();
     }));

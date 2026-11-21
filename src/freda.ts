@@ -121,6 +121,12 @@ export const freda = {
 
   // Cards
   createHolder: (b: Record<string, unknown>) => call("POST", "/v1/cards/holders", b),
+  /**
+   * POST /v1/cards/holder-profile with `restart_verification: true` and the ID photos: starts a NEW verification of the holder that has
+   * this e-mail (same mpc_ id); Freda answers 200 with `restarted: true`. On /v1/cards/holders the flag is not documented: there an
+   * existing e-mail is answered "as is" and nothing is verified again.
+   */
+  restartHolderVerification: (b: Record<string, unknown>) => call("POST", "/v1/cards/holder-profile", { ...b, restart_verification: true }),
   listHolders: (page = 1) => call("GET", `/v1/cards/holders?page=${page}&page_size=100`),
   getHolder: (id: string) => call("GET", `/v1/cards/holders/${encodeURIComponent(id)}`),
   createCard: (b: { reference: string; amount: number; kind?: "individual" | "business"; brand?: string; holder_id?: string; business_name?: string }) =>

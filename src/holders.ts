@@ -7,8 +7,11 @@
 //    (holder.verified / holder.rejected): GET /v1/cards/holders/:id says "enrolled" either way. While it is not accepted, a card would be
 //    issued the old way (no Apple Pay / Google Pay), so the customer can only create a card after holder.verified.
 //    card_holders.verification_status: "verified" (holder.verified received: ready), "failed", anything else: still waiting.
-//  - Freda keeps one holder per e-mail: a customer who already had one is sent again with `restart_verification: true` (same mpc_ id),
-//    which starts a new verification with the complete identity.
+//  - Freda keeps one holder per e-mail: for a customer who already had one, POST /v1/cards/holder-profile with
+//    `restart_verification: true` and the complete identity starts a new verification (same mpc_ id; Freda answers `restarted: true`).
+//    POST /v1/cards/holders does NOT do that: it answers an existing e-mail "as is".
+//  - verification_status "submitted": sent by this version and waiting for the decision. "pending" (or "ready") on a holder that
+//    existed before its program registration comes from an earlier version whose "restart" went to /v1/cards/holders and did nothing.
 import * as L from "./ledger.js";
 import { FredaError, freda, fredaConfigured, fredaMode, pickId } from "./freda.js";
 import { decryptField, encryptField } from "./crypto.js";
@@ -172,19 +175,26 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   };
   // A customer who already has a holder at Freda (same e-mail) gets a NEW verification with the complete identity, same mpc_ id.
   let restart = !!row?.freda_holder_id;
+  let restarted: boolean | null = null;
   let res: any;
+  const restartIt = async () => {
+    restart = true;
+    const r: any = await freda.restartHolderVerification(body);
+    restarted = r?.restarted === true;
+    if (!restarted) console.error("[holder] POST /v1/cards/holder-profile did not answer restarted: true (", why, "):", userId.slice(0, 8), "fields:", Object.keys(r ?? {}).join(","));
+    return r;
+  };
   try {
-    try {
-      res = await freda.createHolder(restart ? { ...body, restart_verification: true } : body);
-    } catch (e) {
-      if (!(e instanceof FredaError && e.code === "HOLDER_EMAIL_EXISTS") || restart) throw e;
-      restart = true;
-      res = await freda.createHolder({ ...body, restart_verification: true });
-    }
-    // Answered with the holder that already existed (same e-mail), without verifying it again: start the new verification.
-    if (res?.already_existed === true && !restart) {
-      restart = true;
-      res = await freda.createHolder({ ...body, restart_verification: true });
+    if (restart) res = await restartIt();
+    else {
+      try {
+        res = await freda.createHolder(body);
+      } catch (e) {
+        if (!(e instanceof FredaError && e.code === "HOLDER_EMAIL_EXISTS")) throw e;
+        res = await restartIt();
+      }
+      // Answered with the holder that already existed (same e-mail), without verifying it again: start the new verification.
+      if (res?.already_existed === true) res = { ...(await restartIt()), id: pickId(res) };
     }
   } catch (e) {
     if (e instanceof FredaError && e.ambiguous) {
@@ -217,10 +227,10 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
     freda_holder_id: holderId, email, first_name: p.first_name, last_name: p.last_name, dob: p.date_of_birth, country, id_number: encryptField(idNumber),
     phone_code: phoneCode, phone_number: phone, address_street: p.address_street, address_city: p.address_city, address_state: p.address_state,
     address_postal_code: p.address_postal_code, status: String(h?.status ?? "pending"), identity_sent: true,
-    verification_status: st.state === "ready" ? "verified" : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : null,
+    verification_status: st.state === "ready" ? "verified" : st.state === "pending" ? "submitted" : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : null,
     program_enrolled_at: now, last_attempt_at: now, checked_at: now,
   });
-  console.log("[holder]", restart ? "verification restarted" : "registered", `(${why})`, String(holderId ?? "?"), "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
+  console.log("[holder]", restart ? (restarted ? "verification restarted" : "restart NOT confirmed by Freda") : "registered", `(${why})`, String(holderId ?? "?"), "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
   await announce(userId, row?.verification_status, st.state);
   return {
     state: st.state, reason: st.state === "ready" ? null : st.state === "failed" ? saved.failure_reason : HOLDER_PENDING_MESSAGE,
@@ -290,7 +300,7 @@ export async function markHolderPending(userId: string) {
 /** Asks Freda about holders that are still being verified (oldest check first). */
 export async function refreshPendingHolders(limit = 10) {
   if (!fredaConfigured()) return;
-  const { data, error } = await L.db.from("card_holders").select("*").eq("mode", fredaMode()).eq("verification_status", "pending")
+  const { data, error } = await L.db.from("card_holders").select("*").eq("mode", fredaMode()).in("verification_status", ["pending", "submitted"])
     .not("freda_holder_id", "is", null).order("checked_at", { ascending: true, nullsFirst: true }).limit(limit);
   if (error) { if (!/verification_status|checked_at/.test(error.message)) console.error("[holder] could not list pending holders:", error.message); return; }
   for (const row of data ?? []) {
@@ -310,7 +320,7 @@ let warnedMigration = false;
 export async function enrollMissingHolders(limit = 3) {
   if (!fredaConfigured()) return;
   const mode = fredaMode();
-  const { data: rows, error } = await L.db.from("card_holders").select("user_id, program_enrolled_at, last_attempt_at, verification_status").eq("mode", mode);
+  const { data: rows, error } = await L.db.from("card_holders").select("user_id, created_at, program_enrolled_at, last_attempt_at, verification_status").eq("mode", mode);
   if (error) {
     if (!warnedMigration) { warnedMigration = true; console.error("[holder] run supabase/migrations/20261121000000_card_program.sql:", error.message); }
     return;
@@ -323,10 +333,12 @@ export async function enrollMissingHolders(limit = 3) {
   for (const r of rows ?? []) {
     const id = String(r.user_id);
     if (r.program_enrolled_at) enrolled.add(id);
-    // Registered by the earlier version: sent again at once (it becomes "pending", so only once).
-    if (r.program_enrolled_at && r.verification_status === "ready") { legacy.push(id); continue; }
+    // Written by an earlier version: "ready" without the webhook, or a "restart" of a holder that already existed, which was sent to
+    // /v1/cards/holders and did nothing. Sent again at once; it becomes "submitted", so only once.
+    const wasRestart = !!r.created_at && !!r.program_enrolled_at && Date.parse(r.program_enrolled_at) - Date.parse(r.created_at) > 60_000;
+    if (r.program_enrolled_at && (r.verification_status === "ready" || (r.verification_status === "pending" && wasRestart))) { legacy.push(id); continue; }
     if (!old(r.last_attempt_at)) { recent.add(id); continue; }
-    if (r.program_enrolled_at && r.verification_status === "pending" && old(r.program_enrolled_at)) stale.push(id);
+    if (r.program_enrolled_at && (r.verification_status === "pending" || r.verification_status === "submitted") && old(r.program_enrolled_at)) stale.push(id);
   }
   const { data: verified } = await L.db.from("profiles").select("id").eq("kyc_status", "verified").order("updated_at", { ascending: false }).limit(2000);
   const never = (verified ?? []).map((v: any) => String(v.id)).filter((id: string) => !enrolled.has(id) && !recent.has(id));
