@@ -12,6 +12,7 @@
 //    POST /v1/cards/holders does NOT do that: it answers an existing e-mail "as is".
 //  - verification_status "submitted": sent by this version and waiting for the decision. "pending" (or "ready") on a holder that
 //    existed before its program registration comes from an earlier version whose "restart" went to /v1/cards/holders and did nothing.
+import { createHash } from "node:crypto";
 import * as L from "./ledger.js";
 import { FredaError, freda, fredaConfigured, fredaMode, pickId } from "./freda.js";
 import { decryptField, encryptField } from "./crypto.js";
@@ -65,8 +66,23 @@ const FIELD_NAMES: Record<string, string> = {
   phone_number: "phone number", address_street: "street address", address_city: "city", address_state: "state", address_postal_code: "postal code",
 };
 
-/** An e-mail that an earlier version tagged (name+kxxxx@host) is turned back into the customer's real one. */
-export const realEmail = (e: unknown) => String(e ?? "").replace(/\+k[a-z0-9]{5,}@/i, "@");
+/** An e-mail that this program tagged (name+kpxxxxxx@host) is turned back into the customer's real one. */
+export const realEmail = (e: unknown) => String(e ?? "").replace(/\+kp[a-f0-9]{6}@/i, "@");
+
+/**
+ * Freda keeps ONE holder per e-mail, so a customer who already has a holder cannot get a new one with the same address (it answers
+ * "as is", or HOLDER_EMAIL_EXISTS). The holder for the new program is registered with a slightly different e-mail: name+kpXXXXXX@host
+ * (the same mailbox for Gmail, Outlook, iCloud and most providers; HOLDER_EMAIL_TAG=false turns this off). XXXXXX comes from the
+ * customer and the previous holder, so an attempt whose answer was lost is repeated with the SAME address (Freda answers with the holder
+ * it already made, never a second one), and each new holder of the same customer gets another address.
+ */
+export const holderEmailTagging = (v: string | undefined = process.env["HOLDER_EMAIL_TAG"]) => String(v ?? "").trim().toLowerCase() !== "false";
+export function taggedEmail(real: string, userId: string, previousHolderId: string | null | undefined): string {
+  const at = real.lastIndexOf("@");
+  if (at < 1) return real;
+  const tag = createHash("sha256").update(`${userId}:${previousHolderId ?? ""}`).digest("hex").slice(0, 6);
+  return `${real.slice(0, at)}+kp${tag}${real.slice(at)}`;
+}
 
 /**
  * What GET /v1/cards/holders/:id (or the POST answer) can tell: only that the registration FAILED. Whether the new program accepted the
@@ -135,7 +151,7 @@ async function announce(userId: string, before: string | null | undefined, after
  * Registers (or registers again) the customer's holder at Freda with the verified identity. Never throws for a Freda refusal:
  * the outcome is saved on the card_holders row and returned. `why` is only for the logs.
  */
-export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "customer"): Promise<HolderInfo> {
+export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "customer", opts: { fresh?: boolean } = {}): Promise<HolderInfo> {
   const none = (state: HolderState, reason: string | null, missing: string[] = []): HolderInfo => ({ state, reason, missing, holderId: null, canRetry: false });
   if (!fredaConfigured()) return none("failed", "The card service is not available right now.");
   const mode = fredaMode();
@@ -173,28 +189,43 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
     address: { street: p.address_street, city: p.address_city, state: p.address_state, postalCode: p.address_postal_code, country },
     identity,
   };
-  // A customer who already has a holder at Freda (same e-mail) gets a NEW verification with the complete identity, same mpc_ id.
-  let restart = !!row?.freda_holder_id;
+  // A customer who already has a holder gets a NEW holder for the new program, registered with a slightly different e-mail (see
+  // taggedEmail). `fresh: false` (a retry after a refusal, a decision that never came) restarts the verification of the holder it has instead.
+  const tagging = holderEmailTagging();
+  const hadHolder = !!row?.freda_holder_id;
+  const fresh = hadHolder && tagging && opts.fresh !== false;
+  let restart = false;
   let restarted: boolean | null = null;
+  let tagged = false;
   let res: any;
-  const restartIt = async () => {
+  const restartIt = async (mail: string) => {
     restart = true;
-    const r: any = await freda.restartHolderVerification(body);
+    const r: any = await freda.restartHolderVerification({ ...body, email: mail });
     restarted = r?.restarted === true;
     if (!restarted) console.error("[holder] POST /v1/cards/holder-profile did not answer restarted: true (", why, "):", userId.slice(0, 8), "fields:", Object.keys(r ?? {}).join(","));
     return r;
   };
+  /** A new holder with the tagged e-mail. Freda answering with the holder it already made for that address is its answer to a repeated attempt. */
+  const createTagged = async () => {
+    tagged = true;
+    body["email"] = taggedEmail(email, userId, row?.freda_holder_id);
+    return freda.createHolder(body);
+  };
   try {
-    if (restart) res = await restartIt();
+    if (fresh) res = await createTagged();
+    else if (hadHolder) res = await restartIt(String(row.email || email)); // the address this holder has at Freda
     else {
       try {
         res = await freda.createHolder(body);
       } catch (e) {
         if (!(e instanceof FredaError && e.code === "HOLDER_EMAIL_EXISTS")) throw e;
-        res = await restartIt();
+        res = tagging ? await createTagged() : await restartIt(email);
       }
-      // Answered with the holder that already existed (same e-mail), without verifying it again: start the new verification.
-      if (res?.already_existed === true) res = { ...(await restartIt()), id: pickId(res) };
+      // Answered with a holder that already existed (same e-mail), verifying nothing: a holder for the new program is made apart.
+      if (res?.already_existed === true && !tagged) {
+        if (tagging) res = await createTagged();
+        else res = { ...(await restartIt(email)), id: pickId(res) };
+      }
     }
   } catch (e) {
     if (e instanceof FredaError && e.ambiguous) {
@@ -224,13 +255,13 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   const early = holderId ? takeEarly(holderId) : null;
   if (early && st.state !== "failed") st = early.verified ? { state: "ready", reason: null } : { state: "failed", reason: rejectedMessage(early.reason) };
   const saved = await saveRow(row, userId, mode, {
-    freda_holder_id: holderId, email, first_name: p.first_name, last_name: p.last_name, dob: p.date_of_birth, country, id_number: encryptField(idNumber),
+    freda_holder_id: holderId, email: String(body["email"]), first_name: p.first_name, last_name: p.last_name, dob: p.date_of_birth, country, id_number: encryptField(idNumber),
     phone_code: phoneCode, phone_number: phone, address_street: p.address_street, address_city: p.address_city, address_state: p.address_state,
     address_postal_code: p.address_postal_code, status: String(h?.status ?? "pending"), identity_sent: true,
     verification_status: st.state === "ready" ? "verified" : st.state === "pending" ? "submitted" : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : null,
     program_enrolled_at: now, last_attempt_at: now, checked_at: now,
   });
-  console.log("[holder]", restart ? (restarted ? "verification restarted" : "restart NOT confirmed by Freda") : "registered", `(${why})`, String(holderId ?? "?"), "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
+  console.log("[holder]", restart ? (restarted ? "verification restarted" : "restart NOT confirmed by Freda") : tagged ? "registered with a tagged e-mail" : "registered", `(${why})`, String(holderId ?? "?"), "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
   await announce(userId, row?.verification_status, st.state);
   return {
     state: st.state, reason: st.state === "ready" ? null : st.state === "failed" ? saved.failure_reason : HOLDER_PENDING_MESSAGE,
@@ -287,7 +318,7 @@ export async function retryHolder(userId: string): Promise<HolderInfo> {
   const cur = await holderInfo(userId);
   if (cur.state === "needs_kyc" || cur.state === "needs_profile" || cur.state === "ready" || cur.state === "pending") return cur;
   if (!cur.canRetry) throw new L.AppError("Please wait a few minutes before trying again.");
-  return enrollHolder(userId, "customer");
+  return enrollHolder(userId, "customer", { fresh: false });
 }
 
 /** The card was refused because the holder is not ready after all: show "being verified" again and let the background pass check it. */
@@ -342,9 +373,10 @@ export async function enrollMissingHolders(limit = 3) {
   }
   const { data: verified } = await L.db.from("profiles").select("id").eq("kyc_status", "verified").order("updated_at", { ascending: false }).limit(2000);
   const never = (verified ?? []).map((v: any) => String(v.id)).filter((id: string) => !enrolled.has(id) && !recent.has(id));
+  const staleSet = new Set(stale);
   const todo = [...new Set([...legacy, ...never, ...stale])].slice(0, limit);
   for (const id of todo) {
-    try { await enrollHolder(id, "backfill"); } catch (e) { console.error("[holder] backfill", id.slice(0, 8), (e as Error).message); }
+    try { await enrollHolder(id, "backfill", { fresh: !staleSet.has(id) }); } catch (e) { console.error("[holder] backfill", id.slice(0, 8), (e as Error).message); }
   }
 }
 
