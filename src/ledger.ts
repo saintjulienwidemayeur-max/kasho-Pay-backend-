@@ -47,6 +47,17 @@ const FREDA_USER_MESSAGES: Record<string, string> = {
   INVALID_PHOTO: "We could not use your ID photo. Please verify your identity again.",
   MISSING_FIELDS: "Some details are missing. Please complete your profile and try again.",
   INDIVIDUAL_CARD_DETAILS_HIDDEN: "Card details are not available for this card.",
+  // New card program
+  AMOUNT_TOO_SMALL: "The minimum is $2.00 for a new card.",
+  CARD_MINIMUM_BALANCE: "At least $1.00 must stay on the card. Close the card to get everything back.",
+  CARD_TERMINATE_SAME_DAY: "A card cannot be closed on the day it was created. Freeze it now and close it tomorrow.",
+  CARD_OPERATION_IN_PROGRESS: "Another operation is running on this card. Please try again in a moment.",
+  CARD_REVEAL_LIMIT: "Too many requests for the card details. Please try again in an hour.",
+  CARD_LIMIT_NOT_EDITABLE: "The spending limit of this card cannot be changed.",
+  HOLDER_UNDERAGE: "The card holder must be at least 18 years old.",
+  HOLDER_COUNTRY_UNSUPPORTED: "Cards cannot be issued for this country.",
+  HOLDER_DOCUMENT_BACK_REQUIRED: "The card issuer needs the back of your ID document. Please contact support.",
+  HOLDER_VERIFICATION_LIMIT: "Too many verification attempts today. Please try again tomorrow.",
 };
 const GENERIC_FREDA = "We could not complete this request. Please try again or contact support.";
 /** The card service wants the holder to complete an identity verification first (HOLDER_NOT_ENROLLED, or Freda's text says so). */
@@ -872,6 +883,8 @@ export async function applyKycDecision(sessionId: string, userId: string): Promi
     Object.assign(patch, await storeKycDocument(userId, idv));
     await updateProfile(userId, patch);
     await notify(userId, "Identity verified", "Your identity has been confirmed.");
+    // Register the card holder at Freda right away (new card program): the issuer's own verification can take a few minutes.
+    void import("./holders.js").then((h) => h.enrollHolder(userId, "kyc")).catch((e) => console.error("[holder] registration after KYC failed:", (e as Error).message));
   } else if (status === "rejected" && cur?.kyc_status !== "rejected") {
     await db.from("profiles").update({ kyc_status: "rejected" }).eq("id", userId);
     await notify(userId, "Verification declined", "We could not verify your identity. You can try again.");

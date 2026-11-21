@@ -13,6 +13,7 @@ import { cardCodeAttemptAllowed, resetCardCodeAttempts } from "./cardcode.js";
 import { MAX_SUBSCRIPTIONS_PER_USER, isAllowedPushEndpoint, pushConfigured, pushPublicKey, sendTestPush, validPushKeys, validTimeZone } from "./push.js";
 import { createSession, diditConfigured, getDecision, mapStatus } from "./didit.js";
 import { linkStillValid, mentionsIdentityVerification, pickVerification, safeHttpsUrl } from "./verification.js";
+import * as H from "./holders.js";
 
 export type { Ctx } from "./types.js";
 type Handler = import("./types.js").Handler;
@@ -22,171 +23,13 @@ const provider = z.enum(["moncash", "natcash"]);
 const providerName = (p: string) => (p === "moncash" ? "MonCash" : "NatCash");
 const cardColor = z.enum(["mint", "sunset", "ocean", "gold", "midnight", "forest", "chrome"]);
 
-// Exactly the card holder fields Freda Pay Issuing requires (POST /v1/cards/holders).
-const holderSchema = z.object({
-  firstName: z.string().trim().min(1).max(60),
-  lastName: z.string().trim().min(1).max(60),
-  dob: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  country: z.string().length(2).transform((s) => s.toUpperCase()),
-  idNumber: z.string().trim().min(3).max(40),
-  phoneCode: z.string().trim().min(2).max(6),
-  phone: z.string().trim().min(6).max(20),
-  street: z.string().trim().min(2).max(120),
-  city: z.string().trim().min(2).max(80),
-  state: z.string().trim().min(2).max(80),
-  postalCode: z.string().trim().min(2).max(20),
-});
-
 async function loadProfile(userId: string) {
   const { data } = await L.db.from("profiles").select("*").eq("id", userId).single();
   return data;
 }
 
-const holderInput = holderSchema.extend({ email: z.string().trim().toLowerCase().email().max(120) });
-
-/** Registers a holder with Freda and saves it for the user. Shared by createHolderFn and createCardFn (automatic holder). */
-async function registerHolder(d: z.infer<typeof holderInput>, c: Ctx) {
-  const mode = fredaMode();
-  const age = (Date.now() - new Date(d.dob).getTime()) / (365.25 * 24 * 3600 * 1000);
-  if (!(age >= 18)) throw new L.AppError("The card holder must be at least 18 years old.");
-
-  // Freda requires an official ID document (type, number, https image) for every holder; it comes from the Didit KYC.
-  const identity = await L.getFredaIdentity(c.userId);
-  // Freda requires `identity` (ID type, number, image) to create a holder: without it the holder is never verified and every card asked
-  // for it waits for ever ("Le titulaire doit d'abord compléter sa vérification d'identité"). Stop here, before anything is created or charged.
-  if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
-  let id: string | undefined;
-  let already = false;
-  let holderStatus = "enrolled"; // what Freda says about the holder: pending means it has not finished verifying the identity yet
-  try {
-    const res: any = await freda.createHolder({
-      identity,
-      firstName: d.firstName, lastName: d.lastName, email: d.email, country: d.country, dob: d.dob,
-      identificationNumber: d.idNumber, phoneShortCode: d.phoneCode, phoneNumber: d.phone.replace(/\D/g, ""),
-      address: { street: d.street, city: d.city, state: d.state, postalCode: d.postalCode, country: d.country },
-    });
-    // What Freda says about the holder and what we sent as ID (no values: kinds and sizes only), to find why a holder is not verified.
-    const hh = res?.holder ?? res?.profile ?? {};
-    const img = (u: unknown) => (typeof u === "string" ? (u.startsWith("data:") ? `base64:${Math.round(u.length / 1024)}KB` : "https-link") : "none");
-    console.log("[holder] POST /v1/cards/holders ->", res?.already_existed ? "already_existed" : "created", "status:", String(hh.status ?? "?"), "failure_reason:", String(hh.failure_reason ?? "-").slice(0, 200),
-      "| sent identity:", identity.type, "front:", img(identity.imageUrl), "back:", img(identity.imageBackUrl), "country:", identity.country ?? "-", "| fields:", Object.keys(res ?? {}).join(","));
-    id = pickId(res); // `id` (mpc_...) is returned at the root; `already_existed: true` also returns the existing id
-    const st = String(res?.holder?.status ?? res?.profile?.status ?? "").toLowerCase();
-    if (st === "pending" || st === "enrolled") holderStatus = st;
-  } catch (e) {
-    if (!L.holderExists(e)) throw e;
-    already = true;
-  }
-  if (!id) {
-    // The creation response may not include the id: read it from the holders list.
-    const f = await L.findExistingHolder(d.email, d.idNumber);
-    id = f.id;
-    if (already && !f.id) {
-      // Freda says this identity already exists (created earlier under another e-mail): reuse that enrolled holder.
-      id = await L.findEnrolledHolderByName(d.firstName, d.lastName, c.userId);
-      if (!id) {
-        console.error("[holder] Freda reports a duplicate identity but no enrolled holder could be matched.");
-        throw new L.AppError("We could not activate your card profile. Please contact support.");
-      }
-    }
-  }
-
-  if (id) {
-    const { data: taken } = await L.db.from("card_holders").select("id, user_id").eq("freda_holder_id", id).eq("mode", mode).maybeSingle();
-    if (taken && taken.user_id !== c.userId) throw new L.AppError("This card holder is already linked to another account.");
-    if (taken) return { holderId: taken.id as string, fredaId: id, linked: true, warning: null as string | null, status: holderStatus };
-  }
-
-  const { data: row, error } = await L.db.from("card_holders").insert({
-    user_id: c.userId, freda_holder_id: id ?? null, mode, email: d.email, first_name: d.firstName, last_name: d.lastName,
-    dob: d.dob, country: d.country, id_number: encryptField(d.idNumber), phone_code: d.phoneCode, phone_number: d.phone.replace(/\D/g, ""),
-    address_street: d.street, address_city: d.city, address_state: d.state, address_postal_code: d.postalCode, status: holderStatus, identity_sent: !!identity,
-  }).select("id").single();
-  if (error) throw error;
-
-  // Remember the details on the profile for next time. A KYC-verified identity (name, birth date, ID) is never overwritten.
-  const { data: prof } = await L.db.from("profiles").select("kyc_status").eq("id", c.userId).single();
-  const contact = {
-    phone_code: d.phoneCode, phone_number: d.phone.replace(/\D/g, ""), address_street: d.street, address_city: d.city,
-    address_state: d.state, address_postal_code: d.postalCode,
-  };
-  await L.db.from("profiles").update(prof?.kyc_status === "verified" ? contact : {
-    ...contact, first_name: d.firstName, last_name: d.lastName, display_name: `${d.firstName} ${d.lastName}`,
-    date_of_birth: d.dob, country: d.country, id_number: encryptField(d.idNumber),
-  }).eq("id", c.userId);
-
-  return {
-    holderId: row.id as string,
-    fredaId: id,
-    linked: !!id,
-    warning: id ? null : "Holder registered. Its ID will be read from the card service when you create the card.",
-    status: holderStatus,
-  };
-}
-
-
-
-/** Holder ids that are forced for a customer (by full name), on top of the HOLDER_OVERRIDES env var: {"first last": "holder id"}. */
-const HOLDER_OVERRIDES: Record<string, string> = { "rosaldo stephene": "mpc_a083f591d5dc1cbf" };
-function holderOverride(profile: any): string | undefined {
-  const norm = (v: unknown) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase().replace(/\s+/g, " ");
-  let env: Record<string, string> = {};
-  try { env = JSON.parse(process.env["HOLDER_OVERRIDES"] ?? "{}"); } catch { /* ignore a bad value */ }
-  const name = norm(`${profile?.first_name ?? ""} ${profile?.last_name ?? ""}`);
-  const id = { ...HOLDER_OVERRIDES, ...Object.fromEntries(Object.entries(env).map(([k, v]) => [norm(k), v])) }[name];
-  return typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : undefined;
-}
-/** An e-mail that an earlier version tagged (name+kxxxx@host) is turned back into the customer's real one. */
-const realEmail = (e: unknown) => String(e ?? "").replace(/\+k[a-z0-9]{5,}@/i, "@");
-const lastReverify = new Map<string, number>();
-/** Sends the holder again (same e-mail) with fresh, whole ID photos: this restarts the identity verification at the card provider. At most once per 10 minutes. */
-async function resendHolder(holder: any, holderFredaId: string, c: Ctx): Promise<boolean> {
-  const last = lastReverify.get(holderFredaId) ?? 0;
-  if (Date.now() - last <= 10 * 60_000) return false;
-  lastReverify.set(holderFredaId, Date.now());
-  // Read the ID photos again from Didit (the whole front and back, not a crop) instead of the copies kept earlier.
-  await L.db.from("profiles").update({ kyc_doc_path: null, kyc_doc_back_path: null }).eq("id", c.userId);
-  await L.refreshKycFromDidit(c.userId);
-  const identity = await L.getFredaIdentity(c.userId);
-  if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
-  await freda.createHolder({
-    firstName: holder.first_name, lastName: holder.last_name, email: realEmail(holder.email), country: holder.country, dob: String(holder.dob).slice(0, 10),
-    identificationNumber: decryptField(holder.id_number), phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
-    address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
-    identity,
-    restart_verification: true, // Freda: starts a NEW verification at the card provider, same holder id
-  }).catch((e: unknown) => console.error("[holder] re-sending the holder failed:", (e as Error).message));
-  console.log("[holder] holder sent again with the ID document:", holderFredaId);
-  return true;
-}
-
-/**
- * Freda only issues a card to a holder whose identity is verified by the card provider (verification.tier 2: GET /v1/cards/holders/:id
- * says `verification.ready_for_cards`), even when the holder is `enrolled`. If it is not ready, the holder is sent again (same e-mail,
- * POST /v1/cards/holders) with the ID document, front AND back, which restarts the verification; then it is checked for a while.
- */
-async function ensureHolderReady(holder: any, holderFredaId: string, c: Ctx): Promise<void> {
-  const ready = async () => {
-    const g: any = await freda.getHolder(holderFredaId);
-    const h = g?.holder ?? g;
-    const v = h?.verification;
-    console.log("[holder] fields:", Object.keys(h ?? {}).join(","), "| verification:", JSON.stringify(v ?? null).slice(0, 200), "| tier:", String(v?.tier ?? "?"), "ready_for_cards:", String(v?.ready_for_cards ?? "?"));
-    return !v || v.ready_for_cards !== false;
-  };
-  if (await ready()) return;
-  await resendHolder(holder, holderFredaId, c);
-  for (let i = 0; i < 6; i++) {
-    await new Promise((r) => setTimeout(r, 10_000));
-    if (await ready()) return;
-  }
-  throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
-}
-
 // Admin access (2FA, roles) lives in admin.ts; re-exported here for the tests that import it from this module.
 export { ADMIN_MFA_MESSAGE, adminMfaOk } from "./admin.js";
-
-/** Text of a Freda error body, only for matching (never logged or shown). */
-const rawText = (raw: unknown) => { try { return JSON.stringify(raw ?? ""); } catch { return ""; } };
 
 /** Client-chosen key that makes a send retry-safe: 8-64 chars, letters, digits, "_" and "-". */
 export const idempotencyKey = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
@@ -194,6 +37,14 @@ export const idempotencyKey = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
 /** True when a stored transfer_out row is the same transfer (same recipient and amount) as the one being requested. */
 export function sameTransfer(prev: { amount: unknown; counterparty_id: unknown }, toId: string, amount: number): boolean {
   return prev.counterparty_id === toId && Math.abs(Math.abs(Number(prev.amount)) - amount) < 0.005;
+}
+
+/** Freda keeps at least $1 on a card after a withdrawal (new card program). */
+export const CARD_MIN_LEFT_USD = 1;
+/** True when the date is the current UTC day (a card cannot be closed on the day it was created). */
+export function createdTodayUtc(createdAt: unknown, now = new Date()): boolean {
+  const t = new Date(String(createdAt ?? ""));
+  return !Number.isNaN(t.getTime()) && t.toISOString().slice(0, 10) === now.toISOString().slice(0, 10);
 }
 
 export const handlers: Record<string, Handler> = {
@@ -215,7 +66,7 @@ export const handlers: Record<string, Handler> = {
         minWithdrawUsd: Math.max(c.minWithdrawUsd, wd?.min ?? 0),
         maxWithdrawUsd: wd?.max ?? null,
         minCardFundUsd: c.minCardFundUsd,
-        minCardPrefundUsd: c.minCardPrefundUsd,
+        minCardPrefundUsd: Math.max(c.minCardPrefundUsd, 2),
         cardClosureFeeUsd: c.cardClosureFeeUsd,
         requireKycForCards: c.requireKycForCards,
         sandbox: fredaConfigured() ? fredaMode() === "sandbox" : true,
@@ -528,21 +379,42 @@ export const handlers: Record<string, Handler> = {
   },
 
   // ---------------------------------------------------------------- cards
-  /** Step 1 of card issuing: register the card holder with Freda (POST /v1/cards/holders). */
-  createHolderFn: {
-    schema: holderInput,
-    run: (d, c) => registerHolder(d, c),
+  /**
+   * Where the customer's card holder is (new card program): needs_kyc, needs_profile, none (not registered yet), pending (the issuer is
+   * verifying it), ready (a card can be created) or failed. The card page shows it and polls it while it is pending.
+   */
+  cardProfileFn: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      const info = await H.holderInfo(c.userId, { refresh: true });
+      // A verified customer who was never registered (or whose profile was just completed) is registered now; while an attempt is
+      // recent, the screen just waits (it polls this every few seconds).
+      if (info.state === "none") return info.canRetry ? H.enrollHolder(c.userId, "customer") : { ...info, state: "pending" as const, reason: H.HOLDER_PENDING_MESSAGE };
+      return info;
+    },
   },
 
-  /** Step 2: issue a card for one of the user's holders. */
+  /** The customer asks for a new verification of the card holder (after completing the profile, or after a refusal). */
+  retryCardProfileFn: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      const cur = await H.holderInfo(c.userId);
+      if (cur.state === "needs_profile") return cur;
+      return H.retryHolder(c.userId);
+    },
+  },
+
+  /**
+   * Issues a card (new card program). Only for a customer whose card holder is "ready": while the issuer is still verifying it, a card
+   * would be issued the old way (no Apple Pay / Google Pay), so nothing is charged and the customer is told to wait.
+   */
   createCardFn: {
     schema: z.object({
       label: z.string().trim().max(40).optional(),
       color: cardColor,
       brand: z.enum(["VISA", "MASTERCARD"]),
       amountUsd: z.number().positive().max(5000),
-      holderId: z.string().uuid().optional(),
-    }),
+    }).passthrough(),
     run: async (d, c) => {
       const cfg = getConfig();
       await L.refreshKycFromDidit(c.userId); // Didit's webhook may never come: ask for the decision now
@@ -551,32 +423,23 @@ export const handlers: Record<string, Handler> = {
         throw new L.AppError("Verify your identity before creating a card.");
       }
       const amount = round2(d.amountUsd);
-      if (amount < cfg.minCardPrefundUsd) throw new L.AppError(`Minimum prefund is $${cfg.minCardPrefundUsd}.`);
+      // The new program needs at least $2 on a new card (the issuer takes its fee from it).
+      const minPrefund = Math.max(cfg.minCardPrefundUsd, 2);
+      if (amount < minPrefund) throw new L.AppError(`Minimum prefund is $${minPrefund}.`);
       const label = d.label?.trim() || "Kasho virtual debit";
-      const fee = computeFee(await L.feeRules(), "card_creation", amount); // read before any holder / card is created
+      const fee = computeFee(await L.feeRules(), "card_creation", amount); // read before anything is charged
 
-      // Cheap check kept in the request: a profile that lacks what Freda requires is refused at once, before anything is charged.
-      {
-        const { data: h0 } = await L.db.from("card_holders").select("id").eq("user_id", c.userId).eq("mode", fredaMode()).limit(1);
-        if (!h0?.length) {
-          const chk = holderInput.safeParse({
-            firstName: profile?.first_name, lastName: profile?.last_name, email: c.email, dob: profile?.date_of_birth, country: profile?.country,
-            idNumber: decryptField(profile?.id_number), phoneCode: profile?.phone_code, phone: profile?.phone_number,
-            street: profile?.address_street, city: profile?.address_city, state: profile?.address_state, postalCode: profile?.address_postal_code,
-          });
-          if (!chk.success) {
-            const names: Record<string, string> = { firstName: "first name", lastName: "last name", dob: "date of birth", country: "country", idNumber: "ID number",
-              phoneCode: "phone code", phone: "phone number", street: "street address", city: "city", state: "state", postalCode: "postal code", email: "email" };
-            throw new L.AppError(`Please complete your profile: ${[...new Set(chk.error.issues.map((i) => names[String(i.path[0])] ?? String(i.path[0])))].join(", ")}.`);
-          }
-        }
-      }
+      // The card holder must be verified by the issuer first. Checked now, before anything is charged.
+      let holder = await H.holderInfo(c.userId, { refresh: true, force: true });
+      if (holder.state === "none") holder = await H.enrollHolder(c.userId, "customer");
+      if (holder.state !== "ready" || !holder.holderId) throw new L.AppError(holder.reason ?? H.HOLDER_PENDING_MESSAGE);
+      const holderFredaId = holder.holderId;
+
       const cardId = crypto.randomUUID();
-      let reference = `kasho_card_${cardId}`;
-
+      const reference = `kasho_card_${cardId}`;
       const txId = await L.debit({
         user: c.userId, kind: "card_creation", title: `New card: ${label}`, category: "Card", method: "Wallet",
-        amount, fee, status: "pending", meta: { label },
+        amount, fee, status: "pending", meta: { label, holder_id: holderFredaId },
       });
       const { error: insErr } = await L.db.from("cards").insert({
         id: cardId, user_id: c.userId, reference, label, color: d.color, brand: d.brand, status: "pending", creation_tx_id: txId,
@@ -586,170 +449,47 @@ export const handlers: Record<string, Handler> = {
         throw insErr;
       }
       await L.db.from("transactions").update({ card_id: cardId }).eq("id", txId);
-      // Everything slow (holder, ID image, Freda) runs after the answer: the customer gets the pending card at once and the app waits for it
-      // (the same sync that settles any pending card). A refusal gives the money back and tells the customer.
+      // Freda answers 202 "pending" at once; the card becomes active a few seconds later (webhook, or the sync the app runs while it waits).
       const finish = async (): Promise<void> => {
-      const mode = fredaMode();
-      // The customer never picks a card holder: the latest one for this account is used, or one is created automatically.
-      // A holder id that was given for this customer is used as it is: the holder already exists, no holder is created or checked.
-      const forced = holderOverride(profile);
-      let holder: any;
-      let holderFredaId: string | undefined = forced;
-      if (forced) console.log("[holder] using the holder id given for this customer:", forced);
-      if (!forced) {
-      const { data: holders } = await L.db.from("card_holders").select("*").eq("user_id", c.userId).eq("mode", mode)
-        .order("created_at", { ascending: false }).limit(1);
-      holder = holders?.[0];
-      if (!holder) {
-        // No holder yet: create it automatically from the verified profile, sending everything Freda requires.
-        const merged = {
-          firstName: profile?.first_name, lastName: profile?.last_name, email: c.email, dob: profile?.date_of_birth,
-          country: profile?.country, idNumber: decryptField(profile?.id_number),
-          phoneCode: profile?.phone_code, phone: profile?.phone_number,
-          street: profile?.address_street, city: profile?.address_city,
-          state: profile?.address_state, postalCode: profile?.address_postal_code,
-        };
-        const parsedHolder = holderInput.safeParse(merged);
-        if (!parsedHolder.success) {
-          const names: Record<string, string> = { firstName: "first name", lastName: "last name", dob: "date of birth", country: "country", idNumber: "ID number",
-            phoneCode: "phone code", phone: "phone number", street: "street address", city: "city", state: "state", postalCode: "postal code", email: "email" };
-          const miss = [...new Set(parsedHolder.error.issues.map((i) => names[String(i.path[0])] ?? String(i.path[0])))];
-          throw new L.AppError(`Please complete your profile: ${miss.join(", ")}.`);
-        }
-        await registerHolder(parsedHolder.data, c);
-        const { data: created } = await L.db.from("card_holders").select("*").eq("user_id", c.userId).eq("mode", mode).order("created_at", { ascending: false }).limit(1);
-        holder = created?.[0];
-        if (!holder) throw new L.AppError("Could not create your card holder. Please try again.");
-      }
-      // The Freda account is shared by all Kasho users: never rely on its "latest holder" default,
-      // always send the exact holder_id of THIS user's holder.
-      // Find this user's ENROLLED holder id on Freda (`mpc_...`), in this order:
-      //  1. the id stored on our holder row (GET /v1/cards/holders/:id), if it is still enrolled;
-      //  2. the holders list (same e-mail or ID number, status enrolled);
-      //  3. POST /v1/cards/holders again: no duplicate is created, Freda answers 200 `already_existed: true` with the id.
-      {
-        const idNumber = decryptField(holder.id_number);
-        let holderPending = false; // the card service has not finished verifying this holder's identity
-        if (holder.freda_holder_id) {
-          try {
-            const g: any = await freda.getHolder(holder.freda_holder_id);
-            const h = g?.holder ?? g;
-            const hs = String(h?.status ?? "").toLowerCase();
-            console.log("[holder] GET stored holder", holder.freda_holder_id, "status:", hs || "?", "failure_reason:", String(h?.failure_reason ?? "-").slice(0, 200));
-            if (!hs || hs === "enrolled" || hs === "pending") holderFredaId = holder.freda_holder_id; // the stored id is what the card request needs
-            else console.error("[holder] stored holder is not enrolled, status:", h.status, "reason:", String(h?.failure_reason ?? "").slice(0, 200));
-          } catch (e) {
-            console.error("[holder] could not read stored holder:", (e as Error).message);
-          }
-        }
-        if (!holderFredaId) holderFredaId = (await L.findExistingHolder(realEmail(holder.email), idNumber)).id;
-        // Nothing is charged, and no second holder is created, for a holder that is still being verified: "Le titulaire doit d'abord
-        // compléter sa vérification d'identité".
-        if (!holderFredaId && holderPending) throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
-        if (!holderFredaId) {
-          const again = holderInput.safeParse({
-            firstName: holder.first_name, lastName: holder.last_name, email: realEmail(holder.email), dob: String(holder.dob).slice(0, 10),
-            country: holder.country, idNumber, phoneCode: holder.phone_code, phone: holder.phone_number,
-            street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code,
-          });
-          if (!again.success) throw new L.AppError("Please complete your profile: phone number and full address.");
-          const r = await registerHolder(again.data, c);
-          if (r.status === "pending") throw new L.AppError(L.IDENTITY_VERIFICATION_MESSAGE);
-          holderFredaId = r.fredaId ?? (await L.findExistingHolder(realEmail(holder.email), idNumber)).id;
-          if (r.holderId !== holder.id) {
-            await L.db.from("card_holders").delete().eq("id", holder.id); // replaced by the new row
-            holder = { ...holder, id: r.holderId };
-          }
-        }
-        if (!holderFredaId) throw new L.AppError("We could not register your card holder with the card service. Please try again or contact support.");
-        if (!holder.identity_sent) {
-          // Holders created before Freda required an ID document: re-send POST /v1/cards/holders with the same e-mail
-          // plus `identity`. Freda upgrades the holder in place (no duplicate).
-          const identity = await L.getFredaIdentity(c.userId);
-          if (!identity) throw new L.AppError("Please complete your identity verification (ID document) before creating a card.");
-          try {
-            await freda.createHolder({
-              firstName: holder.first_name, lastName: holder.last_name, email: realEmail(holder.email), country: holder.country, dob: String(holder.dob).slice(0, 10),
-              identificationNumber: idNumber, phoneShortCode: holder.phone_code, phoneNumber: String(holder.phone_number ?? "").replace(/\D/g, ""),
-              address: { street: holder.address_street, city: holder.address_city, state: holder.address_state, postalCode: holder.address_postal_code, country: holder.country },
-              identity,
-            });
-          } catch (e) {
-            if (e instanceof FredaError) console.error("[holder] identity upgrade rejected", e.status, e.code, e.message);
-            // Freda's own provider answers "customer is already enrolled" when the holder is upgraded: the holder
-            // exists and is usable, so carry on to the card request (a failure there is refunded automatically).
-            if (!(e instanceof FredaError && /already enrolled/i.test(`${e.message} ${rawText(e.raw)}`))) throw e;
-          }
-          await L.db.from("card_holders").update({ identity_sent: true }).eq("id", holder.id);
-        }
-        const { data: takenRows } = await L.db.from("card_holders").select("user_id").eq("freda_holder_id", holderFredaId).eq("mode", mode).neq("id", holder.id);
-        if ((takenRows ?? []).some((r: any) => r.user_id !== c.userId)) throw new L.AppError("This card holder is already linked to another account.");
-        if (holder.freda_holder_id !== holderFredaId) await L.db.from("card_holders").update({ freda_holder_id: holderFredaId }).eq("id", holder.id);
-      }
-
-
-      }
-      // Always send the exact holder_id of THIS user's enrolled holder (the account default may belong to another user).
-      if (!forced) await ensureHolderReady(holder, holderFredaId!, c);
-      await L.mergeTxMeta(await L.getTx(txId), { holder_id: holderFredaId });
-      const cardReq = { reference, kind: "individual" as const, brand: d.brand, amount, holder_id: holderFredaId };
-      let res: any;
-      try {
+        const mode = fredaMode();
+        let res: any;
         try {
-          res = await freda.createCard(cardReq);
-        } catch (first) {
-          // The card provider has not verified this holder's identity yet (Freda: "pas Tier 2"). Sending the holder again with a
-          // legible ID restarts the verification; after a minute the card is asked for once more.
-          if (!(first instanceof FredaError && (first.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(first.message)))) throw first;
-          // A holder id that was given has no stored row: its details come from the profile (the e-mail is the customer's real one).
-          const sendHolder = holder ?? {
-            first_name: profile?.first_name, last_name: profile?.last_name, email: c.email, dob: profile?.date_of_birth, country: profile?.country,
-            id_number: profile?.id_number, phone_code: profile?.phone_code, phone_number: profile?.phone_number, address_street: profile?.address_street,
-            address_city: profile?.address_city, address_state: profile?.address_state, address_postal_code: profile?.address_postal_code,
-          };
-          if (!(await resendHolder(sendHolder, holderFredaId!, c))) throw first;
-          // The new verification can take a few minutes: wait until GET /v1/cards/holders/:id says ready_for_cards (at most ~4 minutes).
-          for (let i = 0; i < 16; i++) {
-            await new Promise((r) => setTimeout(r, 15_000));
-            const g: any = await freda.getHolder(holderFredaId!).catch(() => null);
-            const v = (g?.holder ?? g)?.verification;
-            console.log("[holder] waiting for the verification:", JSON.stringify(v ?? null).slice(0, 160));
-            if (v?.ready_for_cards === true || (v === undefined && i >= 3)) break;
+          res = await freda.createCard({ reference, kind: "individual", brand: d.brand, amount, holder_id: holderFredaId });
+        } catch (e) {
+          if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);
+          if (e instanceof FredaError && e.ambiguous) {
+            // Unknown outcome (timeout, 5xx): the card may well exist at Freda. It stays pending and the same request is replayed
+            // (same `reference`: never a second card) until Freda answers. The customer is NOT told to try again: that would charge twice.
+            await L.rememberCardProblem(txId, e);
+            console.error("[card] the outcome of POST /v1/cards is unknown, it will be retried:", reference);
+            return;
           }
-          res = await freda.createCard(cardReq);
+          // The issuer says the holder is not verified after all: the card page shows "being verified" again.
+          if (e instanceof FredaError && (e.code === "HOLDER_NOT_ENROLLED" || e.code === "HOLDER_NOT_VERIFIED" || mentionsIdentityVerification(e.message))) {
+            await H.markHolderPending(c.userId);
+          }
+          throw e; // refused for good: the caller gives the money back and tells the customer
         }
-      } catch (e) {
-        if (e instanceof FredaError) console.error("[card] Freda rejected POST /v1/cards", "mode:", mode, "->", e.status, e.code, e.message);
-        if (e instanceof FredaError && e.ambiguous) {
-          // Unknown outcome (timeout, 5xx): the card may well exist at Freda. It stays pending and the same request is replayed
-          // (same `reference`: never a second card) until Freda answers. The customer is NOT told to try again: that would charge twice.
-          await L.rememberCardProblem(txId, e);
-          console.error("[card] the outcome of POST /v1/cards is unknown, it will be retried:", reference);
-          return;
+        // From here the card exists at Freda: nothing below may fail the transaction or give the money back. If recording it here
+        // goes wrong, the periodic sync finishes the job (it asks Freda again).
+        try {
+          const { error: idErr } = await L.db.from("cards").update({ freda_card_id: res?.id ?? null }).eq("id", cardId);
+          if (idErr) console.error("[card] could not save the Freda card id:", reference, idErr.message);
+          if (!res?.id) console.error("[card] POST /v1/cards answered without a card id:", reference, Object.keys(res ?? {}).join(","));
+          else console.log("[card] POST /v1/cards accepted:", reference, "->", res.id, "status", String(res.status ?? "?"));
+          const ver = pickVerification(res);
+          if (ver.link || ver.reason) {
+            await L.trackPendingCard({ id: cardId, user_id: c.userId, creation_tx_id: txId, created_at: new Date().toISOString(), reference, freda_card_id: res?.id ?? null }, { fredaStatus: String(res?.status ?? "pending"), verification: ver });
+          }
+          if (res?.status && L.normalizeCardStatus(res.status) !== "pending") {
+            const { data: row } = await L.db.from("cards").select("*").eq("id", cardId).single();
+            if (L.normalizeCardStatus(res.status) === "failed") console.error("[card] Freda created the card as failed:", reference, "reason:", String(res.failure_reason ?? ver.reason ?? "(none)").slice(0, 300));
+            const balance = readCardDetails(res).balance; // the starting balance is the prefund minus the issuer's fee
+            await L.applyCardStatus(row, res.status, balance === undefined ? {} : { balance }, { reason: res.failure_reason ?? ver.reason, link: ver.link, linkExpiresAt: ver.expiresAt });
+          }
+        } catch (e) {
+          console.error("[card] created at Freda but not fully recorded yet, the sync will finish it:", reference, (e as Error).message);
         }
-        // Refused for good: the money goes back now, and Freda's reason is kept on the ledger row for support.
-        throw e; // the caller gives the money back and tells the customer
-      }
-      // From here the card exists at Freda: nothing below may fail the transaction or give the money back. If recording it here
-      // goes wrong, the periodic sync finishes the job (it asks Freda again).
-      try {
-        const { error: idErr } = await L.db.from("cards").update({ freda_card_id: res?.id ?? null }).eq("id", cardId);
-        if (idErr) console.error("[card] could not save the Freda card id:", reference, idErr.message);
-        if (!res?.id) console.error("[card] POST /v1/cards answered without a card id:", reference, Object.keys(res ?? {}).join(","));
-        else console.log("[card] POST /v1/cards accepted:", reference, "->", res.id, "status", String(res.status ?? "?"), "fields:", Object.keys(res).join(","));
-        const ver = pickVerification(res);
-        if (ver.link || ver.reason) {
-          await L.trackPendingCard({ id: cardId, user_id: c.userId, creation_tx_id: txId, created_at: new Date().toISOString(), reference, freda_card_id: res?.id ?? null }, { fredaStatus: String(res?.status ?? "pending"), verification: ver });
-        }
-        if (res?.status && L.normalizeCardStatus(res.status) !== "pending") {
-          const { data: row } = await L.db.from("cards").select("*").eq("id", cardId).single();
-          const why = pickVerification(res);
-          if (L.normalizeCardStatus(res.status) === "failed") console.error("[card] Freda created the card as failed:", reference, "reason:", String(res.failure_reason ?? why.reason ?? "(none)").slice(0, 300));
-          await L.applyCardStatus(row, res.status, {}, { reason: res.failure_reason ?? why.reason, link: why.link, linkExpiresAt: why.expiresAt });
-        }
-      } catch (e) {
-        console.error("[card] created at Freda but not fully recorded yet, the sync will finish it:", reference, (e as Error).message);
-      }
       };
       void finish().catch(async (e) => {
         if (e instanceof FredaError && e.ambiguous) return; // unknown outcome: stays pending, the periodic pass retries
@@ -844,6 +584,10 @@ export const handlers: Record<string, Handler> = {
       const before = readCardDetails(await freda.getCard(card.freda_card_id)).balance;
       if (before === undefined) throw new L.AppError("Could not read the card balance. Try again.");
       if (amount > before + 0.005) throw new L.AppError("That is more than the card balance.");
+      // The card issuer keeps at least $1 on a card after a withdrawal (Freda: CARD_MINIMUM_BALANCE). Closing the card gives everything back.
+      if (amount > before - CARD_MIN_LEFT_USD + 0.005) {
+        throw new L.AppError(`At least $${CARD_MIN_LEFT_USD.toFixed(2)} must stay on the card. You can move up to $${Math.max(0, round2(before - CARD_MIN_LEFT_USD)).toFixed(2)}, or close the card to get everything back.`);
+      }
 
       // The ledger row exists BEFORE the provider call: if the server dies in between, reconcile() settles it.
       const tx = await L.insertTx({
@@ -887,6 +631,10 @@ export const handlers: Record<string, Handler> = {
       if (!card.freda_card_id || card.status === "failed") {
         await L.db.from("cards").update({ status: "terminated", balance: 0 }).eq("id", card.id);
         return { refunded: 0, fee: 0 };
+      }
+      // The card issuer does not close a card on the (UTC) day it was created (Freda: CARD_TERMINATE_SAME_DAY).
+      if (createdTodayUtc(card.created_at)) {
+        throw new L.AppError("A card cannot be closed on the day it was created. Freeze it now and close it tomorrow.");
       }
       let remote: any;
       try {

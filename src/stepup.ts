@@ -29,7 +29,7 @@ export const STEP_UP: Record<string, { field: string; strip: boolean }> = {
  * code when it receives the MFA_REQUIRED error code.
  */
 export const MFA_ENDPOINTS: ReadonlySet<string> = new Set([
-  "sendMoney", "startDeposit", "startWithdrawal", "createCardFn", "createHolderFn", "fundCardFn", "withdrawCardFn",
+  "sendMoney", "startDeposit", "startWithdrawal", "createCardFn", "retryCardProfileFn", "fundCardFn", "withdrawCardFn",
   "terminateCardFn", "freezeCardFn", "removeCardFn", "updateCardFn", "setCardCode", "revealCardFn", "getIdentity",
   "changePassword", "changeEmail", "createKycSession", "adminListFees", "adminSaveFee", "adminDeleteFee",
   // admin panel (adminStatus is not here on purpose: the page uses it to explain what is missing before 2FA is set up)

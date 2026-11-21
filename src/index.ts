@@ -9,6 +9,7 @@ import { getConfig } from "./config.js";
 import { isSuspended } from "./security.js";
 import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, adminRequire2fa, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { loadRate } from "./admin.js";
+import * as H from "./holders.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { initPush, runMorningGreetings } from "./push.js";
@@ -140,7 +141,8 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   startWithdrawal: { windowMs: MIN, max: 5 },
   startDeposit: { windowMs: MIN, max: 10 },
   createCardFn: { windowMs: MIN, max: 5 },
-  createHolderFn: { windowMs: HOUR, max: 10 },
+  cardProfileFn: { windowMs: MIN, max: 30 },
+  retryCardProfileFn: { windowMs: HOUR, max: 10 },
   fundCardFn: { windowMs: MIN, max: 10 },
   withdrawCardFn: { windowMs: MIN, max: 10 },
   terminateCardFn: { windowMs: MIN, max: 5 },
@@ -308,6 +310,9 @@ async function reconcile() {
     }
     // New cards still "pending": asked about every round (newest first), whatever else is waiting.
     await L.settlePendingCards(tick);
+    // New card program: holders still being verified by the issuer, then customers not registered yet (everyone verified before it).
+    if (tick % 2 === 0) await H.refreshPendingHolders();
+    if (tick % 4 === 1) await H.enrollMissingHolders();
     if (tick % 2 === 0 && diditConfigured()) await L.settlePendingKyc(); // asks Didit about every pending identity verification, about once a minute
     // Card fundings whose Freda answer was unknown (meta.needs_review): replay POST /fund with the same reference
     // (idempotent). Only for rows younger than 24h; older ones stay flagged for manual review and are logged hourly.

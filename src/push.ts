@@ -78,6 +78,10 @@ const exact = (s: string, fr: string): [RegExp, () => string] => [new RegExp(`^$
 export const PUSH_RULES: Rule[] = [
   // The body is a reply an administrator wrote: it is sent as written, only the title is translated.
   { title: "Reply from Kasho Pay support", fr: "Réponse du support Kasho Pay", bodies: [], freeText: true },
+  { title: "Card profile verified", fr: "Profil de carte vérifié", bodies: [exact("You can now create your card. It works with Apple Pay and Google Pay.",
+    "Vous pouvez maintenant créer votre carte. Elle fonctionne avec Apple Pay et Google Pay.")] },
+  { title: "Card profile not verified", fr: "Profil de carte non vérifié", bodies: [exact("The card issuer could not verify your identity. Open Cards to see what to do.",
+    "L'émetteur des cartes n'a pas pu vérifier votre identité. Ouvrez Cartes pour voir quoi faire.")] },
   { title: "Deposit not credited", fr: "Dépôt non crédité", bodies: [[
     /^We received (\S+) HTG instead of the (\S+) HTG you requested, so your wallet was not credited\. Our support team will contact you about the amount we received\.$/,
     (m) => `Nous avons reçu ${m[1]} HTG au lieu des ${m[2]} HTG demandés, votre portefeuille n'a donc pas été crédité. Notre équipe support vous contactera au sujet du montant reçu.`]] },
