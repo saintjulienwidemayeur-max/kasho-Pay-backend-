@@ -488,10 +488,12 @@ test("after the KYC a new customer is registered with the front AND back of the 
 
 test("tagged e-mail: same mailbox, stable for a repeated attempt, different for the next holder; the real one is recovered", () => {
   const t1 = H.taggedEmail("marie@example.com", USER, "mpc_1");
-  assert.match(t1, /^marie\+kp[a-f0-9]{6}@example\.com$/);
+  assert.match(t1, /^marie[1-9][0-9]?@example\.com$/, "1 or 2 digits after the name, no + tag");
   assert.equal(H.taggedEmail("marie@example.com", USER, "mpc_1"), t1, "an attempt whose answer was lost is repeated with the same address");
   assert.notEqual(H.taggedEmail("marie@example.com", USER, "mpc_2"), t1, "the next holder of the same customer gets another address");
-  assert.equal(H.realEmail(t1), "marie@example.com");
+  assert.notEqual(H.taggedEmail("marie@example.com", USER, "mpc_1", 1), t1, "the next address is tried when one belongs to someone else");
+  assert.ok(!t1.includes("+"));
+  assert.equal(H.realEmail(t1), t1, "the real e-mail comes from the account, never from the holder");
   assert.equal(H.realEmail("marie@example.com"), "marie@example.com");
   assert.equal(H.holderEmailTagging("false"), false);
   assert.equal(H.holderEmailTagging(undefined), true);
@@ -524,7 +526,7 @@ test("Freda answers with the holder that already existed (same e-mail) without v
     assert.deepEqual([info.state, info.holderId], ["pending", "mpc_10"]);
   }));
   assert.equal(emails[0], "marie@example.com");
-  assert.match(emails[1]!, /^marie\+kp[a-f0-9]{6}@example\.com$/);
+  assert.match(emails[1]!, /^marie[1-9][0-9]?@example\.com$/);
 });
 
 test("an e-mail already used by a holder (HOLDER_EMAIL_EXISTS): the new holder is made with the tagged e-mail", async () => {
@@ -537,7 +539,7 @@ test("an e-mail already used by a holder (HOLDER_EMAIL_EXISTS): the new holder i
     assert.equal((await H.enrollHolder(USER, "kyc")).holderId, "mpc_7");
   }));
   assert.equal(emails.length, 2);
-  assert.match(emails[1]!, /\+kp[a-f0-9]{6}@/);
+  assert.match(emails[1]!, /^marie[1-9][0-9]?@example\.com$/);
 });
 
 test("with HOLDER_EMAIL_TAG=false (or a retry after a refusal) the verification of the holder it has is restarted instead, with the e-mail that holder has", async () => {
@@ -647,7 +649,7 @@ test("holders written by earlier versions get a new holder (tagged e-mail); one 
     await H.enrollMissingHolders(); // the second round does not send them again
   }));
   assert.equal(created.length, 2);
-  assert.ok(created.every((e) => /\+kp[a-f0-9]{6}@/.test(e)));
+  assert.ok(created.every((e) => /^[a-z]+[1-9][0-9]?@example\.com$/.test(e)));
   assert.deepEqual(db.table("card_holders").map((r) => r.verification_status), ["submitted", "submitted"], "they wait for holder.verified again");
 
   // a registration of this version waits; one that waits for more than 6 hours is restarted (same holder), not duplicated
@@ -663,4 +665,23 @@ test("holders written by earlier versions get a new holder (tagged e-mail); one 
     }));
   }
   assert.equal(restarts, 1, "only the holder that waits for more than 6 hours is restarted");
+});
+
+test("an address of the tagged kind that belongs to ANOTHER holder is skipped; one that is this customer's (a repeated attempt) is accepted", async () => {
+  const db = world({ card_holders: [holderRow({ verification_status: null, program_enrolled_at: null, last_attempt_at: null, checked_at: null })] });
+  const tried: string[] = [];
+  await inWorld(db, () => withDeps({}, async () => {
+    freda.createHolder = (async (b: any) => {
+      tried.push(b.email);
+      if (tried.length === 1) return { id: "mpc_other", already_existed: true, holder: { id: "mpc_other", first_name: "Paul", last_name: "Louis", dob: "1980-01-01" } };
+      if (tried.length === 2) throw fredaErr(409, "HOLDER_EMAIL_EXISTS", "email", "POST /v1/cards/holders");
+      return { id: "mpc_mine", already_existed: true, holder: { id: "mpc_mine", first_name: "Marie", last_name: "Jean", dob: "1990-05-12" } };
+    }) as any;
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+    const info = await H.enrollHolder(USER, "backfill");
+    assert.equal(info.holderId, "mpc_mine");
+  }));
+  assert.equal(tried.length, 3);
+  assert.equal(new Set(tried).size, 3, "a different address each time");
+  assert.equal(db.table("card_holders")[0]!.email, tried[2]);
 });

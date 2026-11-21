@@ -66,22 +66,30 @@ const FIELD_NAMES: Record<string, string> = {
   phone_number: "phone number", address_street: "street address", address_city: "city", address_state: "state", address_postal_code: "postal code",
 };
 
-/** An e-mail that this program tagged (name+kpxxxxxx@host) is turned back into the customer's real one. */
+/** The customer's real e-mail (an address tagged by a test version, name+kpxxxxxx@host, is turned back into it). */
 export const realEmail = (e: unknown) => String(e ?? "").replace(/\+kp[a-f0-9]{6}@/i, "@");
 
 /**
  * Freda keeps ONE holder per e-mail, so a customer who already has a holder cannot get a new one with the same address (it answers
- * "as is", or HOLDER_EMAIL_EXISTS). The holder for the new program is registered with a slightly different e-mail: name+kpXXXXXX@host
- * (the same mailbox for Gmail, Outlook, iCloud and most providers; HOLDER_EMAIL_TAG=false turns this off). XXXXXX comes from the
- * customer and the previous holder, so an attempt whose answer was lost is repeated with the SAME address (Freda answers with the holder
- * it already made, never a second one), and each new holder of the same customer gets another address.
+ * "as is", or HOLDER_EMAIL_EXISTS). The holder for the new program is registered with a slightly different e-mail: 1 or 2 digits are
+ * added after the name (marie@example.com -> marie7@example.com, marie42@example.com). HOLDER_EMAIL_TAG=false turns this off.
+ * The digits come from the customer and the previous holder, so an attempt whose answer was lost is repeated with the SAME address
+ * (`attempt` 0) and Freda answers with the holder it already made; if that address belongs to someone else, the next one is tried.
  */
 export const holderEmailTagging = (v: string | undefined = process.env["HOLDER_EMAIL_TAG"]) => String(v ?? "").trim().toLowerCase() !== "false";
-export function taggedEmail(real: string, userId: string, previousHolderId: string | null | undefined): string {
+export function taggedEmail(real: string, userId: string, previousHolderId: string | null | undefined, attempt = 0): string {
   const at = real.lastIndexOf("@");
   if (at < 1) return real;
-  const tag = createHash("sha256").update(`${userId}:${previousHolderId ?? ""}`).digest("hex").slice(0, 6);
-  return `${real.slice(0, at)}+kp${tag}${real.slice(at)}`;
+  const h = createHash("sha256").update(`${userId}:${previousHolderId ?? ""}`).digest().readUInt32BE(0);
+  return `${real.slice(0, at)}${((h + attempt) % 99) + 1}${real.slice(at)}`; // 1 to 99: one or two digits
+}
+/** How many addresses are tried for one holder before giving up (an address can belong to another holder). */
+const TAG_ATTEMPTS = 6;
+/** True when the holder Freda answered with is this customer's (same name and birth date): an earlier attempt whose answer was lost. */
+export function isSameHolder(h: any, p: Record<string, any>): boolean {
+  const norm = (v: unknown) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
+  const o = h?.holder ?? h?.profile ?? h ?? {};
+  return norm(o.first_name) === norm(p["first_name"]) && norm(o.last_name) === norm(p["last_name"]) && String(o.dob ?? "").slice(0, 10) === String(p["date_of_birth"] ?? "").slice(0, 10);
 }
 
 /**
@@ -205,11 +213,26 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
     if (!restarted) console.error("[holder] POST /v1/cards/holder-profile did not answer restarted: true (", why, "):", userId.slice(0, 8), "fields:", Object.keys(r ?? {}).join(","));
     return r;
   };
-  /** A new holder with the tagged e-mail. Freda answering with the holder it already made for that address is its answer to a repeated attempt. */
+  /**
+   * A new holder with a slightly different e-mail (digits after the name). Freda answering with a holder that is this customer's is the
+   * answer to a repeated attempt; an address that belongs to someone else (HOLDER_EMAIL_EXISTS, or another person's holder) moves on to the next.
+   */
   const createTagged = async () => {
     tagged = true;
-    body["email"] = taggedEmail(email, userId, row?.freda_holder_id);
-    return freda.createHolder(body);
+    let last: unknown = null;
+    for (let k = 0; k < TAG_ATTEMPTS; k++) {
+      body["email"] = taggedEmail(email, userId, row?.freda_holder_id, k);
+      try {
+        const r: any = await freda.createHolder(body);
+        if (r?.already_existed === true && !isSameHolder(r, p)) { last = r; continue; }
+        return r;
+      } catch (e) {
+        if (e instanceof FredaError && e.code === "HOLDER_EMAIL_EXISTS") { last = e; continue; }
+        throw e;
+      }
+    }
+    if (last instanceof Error) throw last;
+    throw new FredaError(409, "HOLDER_EMAIL_EXISTS", "No free e-mail address for the holder.");
   };
   try {
     if (fresh) res = await createTagged();
