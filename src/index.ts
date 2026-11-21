@@ -91,6 +91,8 @@ app.post("/api/webhooks/freda", express.raw({ type: "*/*", limit: "1mb" }), asyn
         }
       } else if (type.startsWith("card.")) {
         await L.handleCardEvent(type, d);
+      } else if (type === "holder.verified" || type === "holder.rejected") {
+        await H.handleHolderEvent(type, d); // the new card program accepted (or not) a card holder
       }
     } catch (e) {
       console.error("[webhook] processing error", type, (e as Error)?.message);

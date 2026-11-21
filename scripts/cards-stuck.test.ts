@@ -137,7 +137,7 @@ const holderRow = (o: Row = {}) => ({
   id: "h1", user_id: USER, freda_holder_id: "mpc_1", mode: "sandbox", email: "marie@example.com", first_name: "Marie", last_name: "Jean", dob: "1990-05-12", country: "HT",
   id_number: "ABC12345", phone_code: "+509", phone_number: "37001234", address_street: "12 Rue A", address_city: "Port-au-Prince", address_state: "Ouest",
   address_postal_code: "HT6110", status: "enrolled", identity_sent: true, created_at: iso(86_400_000),
-  verification_status: "ready", program_enrolled_at: iso(86_400_000), last_attempt_at: iso(86_400_000), checked_at: iso(86_400_000), ...o,
+  verification_status: "verified", program_enrolled_at: iso(86_400_000), last_attempt_at: iso(86_400_000), checked_at: iso(86_400_000), ...o,
 });
 function world(extra: Record<string, Row[]> = {}, hooks: Parameters<typeof memDb>[1] = {}): Mem {
   return memDb({
@@ -239,7 +239,7 @@ test("a rejection of POST /v1/cards (HOLDER_NOT_ENROLLED: the holder must comple
 });
 
 test("a holder that the issuer is still verifying: nothing is charged, no card is asked for, the customer is told to wait", async () => {
-  const db = world();
+  const db = world({ card_holders: [holderRow({ verification_status: "pending" })] });
   let message = "";
   await inWorld(db, async () => {
     freda.getHolder = (async () => ({ holder: { status: "enrolled", verification: { ready_for_cards: false } } })) as any;
@@ -452,33 +452,36 @@ async function withDeps<T>(o: { identity?: any; email?: string }, fn: () => Prom
   try { return await fn(); } finally { Object.assign(H.deps, before); }
 }
 
-test("holder state from Freda: enrolled is ready unless the new issuer has not finished, failed is failed", () => {
-  assert.equal(H.readHolderState({ status: "enrolled" }).state, "ready");
-  assert.equal(H.readHolderState({ status: "enrolled", verification: { ready_for_cards: true } }).state, "ready");
-  assert.equal(H.readHolderState({ status: "enrolled", verification: { ready_for_cards: false } }).state, "pending");
+test("GET holder can only say 'failed': acceptance by the new program comes by webhook (holder.verified)", () => {
+  assert.equal(H.readHolderState({ status: "enrolled" }).state, "pending", "enrolled is NOT accepted by the program");
   assert.equal(H.readHolderState({ status: "pending" }).state, "pending");
   assert.deepEqual(H.readHolderState({ status: "failed", failure_reason: "photo coupée" }), { state: "failed", reason: "photo coupée" });
-  assert.equal(H.readHolderState({ status: "enrolled", verification: { status: "declined" } }).state, "failed");
+  assert.equal(H.stateOfRow("verified"), "ready");
+  assert.equal(H.stateOfRow("ready"), "pending", "a row an earlier version marked ready without the webhook waits for it");
+  assert.equal(H.stateOfRow("failed"), "failed");
+  assert.equal(H.rejectedMessage("Photo coupée."), "The card issuer did not accept your ID document: Photo coupée. Try again, or contact support.");
+  assert.equal(H.rejectedMessage(null), "The card issuer did not accept your ID document. Try again, or contact support.");
 });
 
 test("after the KYC a new customer is registered with the front AND back of the ID; the customer is told when the issuer verified it", async () => {
   const db = world({ card_holders: [] });
   const sent: any[] = [];
-  let holderStatus: any = { status: "enrolled", verification: { ready_for_cards: false } };
   await inWorld(db, () => withDeps({}, async () => {
     freda.createHolder = (async (b: any) => { sent.push(b); return { id: "mpc_new", already_existed: false, holder: { id: "mpc_new", status: "enrolled" } }; }) as any;
-    freda.getHolder = (async () => ({ holder: holderStatus })) as any;
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
     const info = await H.enrollHolder(USER, "kyc");
-    assert.deepEqual([info.state, info.holderId], ["pending", "mpc_new"]);
-    holderStatus = { status: "enrolled", verification: { ready_for_cards: true } };
+    assert.deepEqual([info.state, info.holderId], ["pending", "mpc_new"], "enrolled at Freda, but not accepted by the program yet");
     await H.refreshPendingHolders();
+    assert.equal(db.table("card_holders")[0]!.verification_status, "pending", "polling never makes it ready");
+    await H.handleHolderEvent("holder.verified", { id: "mpc_new" });
+    assert.equal((await H.holderInfo(USER)).state, "ready");
   }));
   assert.equal(sent.length, 1);
   assert.equal(sent[0].restart_verification, undefined, "a first registration is not a restart");
   assert.equal(sent[0].identity.imageBackUrl, IDENTITY.imageBackUrl, "the back of the ID is sent");
   assert.deepEqual([sent[0].email, sent[0].phoneShortCode, sent[0].phoneNumber, sent[0].address.postalCode], ["marie@example.com", "+509", "37001234", "HT6110"]);
   const row = db.table("card_holders")[0]!;
-  assert.deepEqual([row.freda_holder_id, row.verification_status], ["mpc_new", "ready"]);
+  assert.deepEqual([row.freda_holder_id, row.verification_status], ["mpc_new", "verified"]);
   assert.ok(row.program_enrolled_at);
   assert.deepEqual(notifications(db), ["Card profile verified"], "told once, when it became ready");
 });
@@ -504,7 +507,7 @@ test("Freda answers with the holder that already existed (same e-mail) without v
     freda.createHolder = (async (b: any) => { sent.push(b); return { id: "mpc_9", already_existed: !b.restart_verification, holder: { id: "mpc_9", status: "enrolled" } }; }) as any;
     freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
     const info = await H.enrollHolder(USER, "backfill");
-    assert.equal(info.state, "ready");
+    assert.equal(info.state, "pending");
   }));
   assert.deepEqual(sent.map((b) => b.restart_verification ?? false), [false, true]);
 });
@@ -521,7 +524,7 @@ test("no holder is sent without the back of a national ID card, nor for an incom
   let called = 0;
   await inWorld(passport, () => withDeps({ identity: { ...IDENTITY, type: "PASSPORT", imageBackUrl: undefined } }, async () => {
     freda.createHolder = (async () => { called++; return { id: "mpc_p", holder: { status: "enrolled" } }; }) as any;
-    assert.equal((await H.enrollHolder(USER, "kyc")).state, "ready");
+    assert.equal((await H.enrollHolder(USER, "kyc")).state, "pending");
   }));
   assert.equal(called, 1);
   const incomplete = world({ card_holders: [] });
@@ -555,4 +558,35 @@ test("a customer whose KYC is not verified is never registered", async () => {
     await H.enrollMissingHolders();
   }));
   assert.equal(db.table("card_holders").length, 0);
+});
+
+test("holder.rejected: the customer sees why and is told; a new verification can be asked for", async () => {
+  const db = world({ card_holders: [holderRow({ verification_status: "pending", last_attempt_at: iso(3_600_000) })] });
+  await inWorld(db, async () => {
+    await H.handleHolderEvent("holder.rejected", { id: "mpc_1", reason: "Photo coupée" });
+    const info = await H.holderInfo(USER);
+    assert.deepEqual([info.state, info.reason, info.canRetry], ["failed", "The card issuer did not accept your ID document: Photo coupée. Try again, or contact support.", true]);
+  });
+  assert.deepEqual(notifications(db), ["Card profile not verified"]);
+});
+
+test("a verified holder is never brought back to 'waiting' by polling, and the card can be created", async () => {
+  const db = world();
+  await inWorld(db, async () => {
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+    assert.equal((await H.holderInfo(USER, { refresh: true, force: true })).state, "ready");
+  });
+  assert.equal(db.table("card_holders")[0]!.verification_status, "verified");
+});
+
+test("holder.verified that arrives before the holder id was saved is applied when the registration finishes", async () => {
+  const db = world({ card_holders: [] });
+  await inWorld(db, () => withDeps({}, async () => {
+    await H.handleHolderEvent("holder.verified", { id: "mpc_fast" });
+    freda.createHolder = (async () => ({ id: "mpc_fast", holder: { id: "mpc_fast", status: "enrolled" } })) as any;
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+    assert.equal((await H.enrollHolder(USER, "kyc")).state, "ready");
+  }));
+  assert.equal(db.table("card_holders")[0]!.verification_status, "verified");
+  assert.deepEqual(notifications(db), ["Card profile verified"]);
 });
