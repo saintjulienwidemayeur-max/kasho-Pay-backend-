@@ -300,8 +300,12 @@ export async function refreshPendingHolders(limit = 10) {
 
 let warnedMigration = false;
 /**
- * Customers whose KYC is verified but who are not registered in the new card program yet (everyone verified before it, and anyone whose
- * registration failed for a reason that can pass later): a few per round, each at most every 6 hours.
+ * Sends to the new card program, a few per round, the customers who need it:
+ *  1. holders registered by an earlier version, before the holder.verified / holder.rejected webhooks were read (verification_status
+ *     "ready"): their decision may have been lost, so their verification is restarted once;
+ *  2. customers whose KYC is verified but who were never registered in the program (everyone verified before it);
+ *  3. holders still waiting for the program's decision 6 hours after their registration (the webhook never came).
+ * Each customer at most every 6 hours (Freda allows 5 verifications per 24 h).
  */
 export async function enrollMissingHolders(limit = 3) {
   if (!fredaConfigured()) return;
@@ -311,14 +315,22 @@ export async function enrollMissingHolders(limit = 3) {
     if (!warnedMigration) { warnedMigration = true; console.error("[holder] run supabase/migrations/20261121000000_card_program.sql:", error.message); }
     return;
   }
-  const done = new Set<string>();
+  const old = (iso: unknown) => !iso || Date.now() - Date.parse(String(iso)) >= AUTO_RETRY_MS;
+  const enrolled = new Set<string>();
   const recent = new Set<string>();
+  const legacy: string[] = [];
+  const stale: string[] = [];
   for (const r of rows ?? []) {
-    if (r.program_enrolled_at) done.add(r.user_id);
-    if (r.last_attempt_at && Date.now() - Date.parse(r.last_attempt_at) < AUTO_RETRY_MS) recent.add(r.user_id);
+    const id = String(r.user_id);
+    if (r.program_enrolled_at) enrolled.add(id);
+    // Registered by the earlier version: sent again at once (it becomes "pending", so only once).
+    if (r.program_enrolled_at && r.verification_status === "ready") { legacy.push(id); continue; }
+    if (!old(r.last_attempt_at)) { recent.add(id); continue; }
+    if (r.program_enrolled_at && r.verification_status === "pending" && old(r.program_enrolled_at)) stale.push(id);
   }
   const { data: verified } = await L.db.from("profiles").select("id").eq("kyc_status", "verified").order("updated_at", { ascending: false }).limit(2000);
-  const todo = (verified ?? []).map((v: any) => String(v.id)).filter((id: string) => !done.has(id) && !recent.has(id)).slice(0, limit);
+  const never = (verified ?? []).map((v: any) => String(v.id)).filter((id: string) => !enrolled.has(id) && !recent.has(id));
+  const todo = [...new Set([...legacy, ...never, ...stale])].slice(0, limit);
   for (const id of todo) {
     try { await enrollHolder(id, "backfill"); } catch (e) { console.error("[holder] backfill", id.slice(0, 8), (e as Error).message); }
   }

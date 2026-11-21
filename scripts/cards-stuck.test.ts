@@ -590,3 +590,30 @@ test("holder.verified that arrives before the holder id was saved is applied whe
   assert.equal(db.table("card_holders")[0]!.verification_status, "verified");
   assert.deepEqual(notifications(db), ["Card profile verified"]);
 });
+
+test("holders registered before the webhooks were read, and holders whose decision never came, get a new verification", async () => {
+  const legacy = holderRow({ verification_status: "ready", last_attempt_at: iso(3_600_000) });
+  const db = world({ card_holders: [legacy] });
+  const sent: any[] = [];
+  await inWorld(db, () => withDeps({}, async () => {
+    freda.createHolder = (async (b: any) => { sent.push(b); return { id: "mpc_1", holder: { id: "mpc_1", status: "enrolled" } }; }) as any;
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+    await H.enrollMissingHolders();
+    await H.enrollMissingHolders(); // the second round does not send it again
+  }));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].restart_verification, true);
+  assert.equal(db.table("card_holders")[0]!.verification_status, "pending", "it waits for holder.verified again");
+
+  const waiting = world({ card_holders: [holderRow({ verification_status: "pending", program_enrolled_at: iso(7 * 3_600_000), last_attempt_at: iso(7 * 3_600_000) })] });
+  const fresh = world({ card_holders: [holderRow({ verification_status: "pending", program_enrolled_at: iso(3_600_000), last_attempt_at: iso(3_600_000) })] });
+  let calls = 0;
+  for (const db2 of [waiting, fresh]) {
+    await inWorld(db2, () => withDeps({}, async () => {
+      freda.createHolder = (async () => { calls++; return { id: "mpc_1", holder: { status: "enrolled" } }; }) as any;
+      freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+      await H.enrollMissingHolders();
+    }));
+  }
+  assert.equal(calls, 1, "only the holder that waits for more than 6 hours is sent again");
+});
