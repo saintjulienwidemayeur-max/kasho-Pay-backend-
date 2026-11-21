@@ -90,7 +90,7 @@ test("adminStatus works without 2FA so the page can explain what is missing", as
 
 test("every admin endpoint asks for 2FA, and the money ones for the password again", () => {
   const names = Object.keys(A.adminHandlers);
-  assert.equal(names.length, 20);
+  assert.equal(names.length, 22);
   for (const n of names) if (n !== "adminStatus") assert.ok(MFA_ENDPOINTS.has(n), `${n} must be in MFA_ENDPOINTS`);
   assert.ok(!MFA_ENDPOINTS.has("adminStatus"));
   for (const n of ["adminAdjustBalance", "adminSetUserBlocked", "adminSaveFee", "adminDeleteFee", "adminSetRate", "adminCreateAdmin"]) {

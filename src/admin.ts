@@ -11,6 +11,7 @@ import { supabaseAdmin } from "./supabase.js";
 import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOperation, type FeeRule } from "./fees.js";
 import type { Ctx, Handler } from "./types.js";
 import { adminRequire2fa } from "./stepup.js";
+import * as H from "./holders.js";
 
 const hasTotp = (u: any): boolean => (u?.factors ?? []).some((f: any) => f?.factor_type === "totp" && f?.status === "verified");
 
@@ -646,6 +647,29 @@ export const adminHandlers: Record<string, Handler> = {
       await L.notify(to, "Reply from Kasho Pay support", d.reply);
       await audit(c, "support_replied", { kind: d.kind, id: d.id }, String(row.user_id));
       return { ok: true as const, repliedAt };
+    },
+  },
+
+  /** The customers with a verified KYC and where their card holder is (new card program): never sent, waiting, verified, refused. */
+  adminListHolders: {
+    schema: z.object({}).passthrough(),
+    run: async (_d, c) => {
+      await requireAdmin(c);
+      return H.holderOverview();
+    },
+  },
+
+  /**
+   * Sends one customer's card holder to Freda NOW (no waiting for the background pass): `new` makes a holder with a slightly different
+   * e-mail, `restart` restarts the verification of the holder the customer already has. The answer says what Freda did.
+   */
+  adminSendHolder: {
+    schema: z.object({ userId: uuid, how: z.enum(["new", "restart"]).default("new") }),
+    run: async (d, c) => {
+      await requireAdmin(c, "super");
+      const info = await H.enrollHolder(d.userId, "customer", { fresh: d.how === "new" });
+      await audit(c, "holder_sent", { how: d.how, state: info.state }, d.userId);
+      return { state: info.state, reason: info.reason, holderId: info.holderId };
     },
   },
 

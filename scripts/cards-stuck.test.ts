@@ -685,3 +685,24 @@ test("an address of the tagged kind that belongs to ANOTHER holder is skipped; o
   assert.equal(new Set(tried).size, 3, "a different address each time");
   assert.equal(db.table("card_holders")[0]!.email, tried[2]);
 });
+
+test("holder overview for the admin: never sent, waiting, verified, refused; and the send-now button really sends", async () => {
+  const OTHER2 = "33333333-3333-3333-3333-333333333333";
+  const db = world({ card_holders: [holderRow({ verification_status: "submitted", program_enrolled_at: iso(3_600_000) })] });
+  db.table("profiles").push({ id: OTHER, kyc_status: "verified", first_name: "Jean", last_name: "Paul", display_name: "Jean Paul" });
+  db.table("profiles").push({ id: OTHER2, kyc_status: "pending", first_name: "Luc", last_name: "Remy" });
+  const ov = await inWorld(db, () => H.holderOverview());
+  assert.equal(ov.total, 2, "only customers with a verified KYC");
+  assert.deepEqual(ov.counts, { none: 1, needs_profile: 0, submitted: 1, verified: 0, failed: 0 });
+  assert.equal(ov.items.find((i: any) => i.userId === USER)!.status, "submitted");
+  assert.equal(ov.items.find((i: any) => i.userId === OTHER)!.status, "none");
+
+  const sent: any[] = [];
+  const info = await inWorld(db, () => withDeps({}, async () => {
+    freda.createHolder = (async (b: any) => { sent.push(b); return { id: "mpc_btn", holder: { id: "mpc_btn", status: "enrolled" } }; }) as any;
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+    return H.enrollHolder(USER, "customer", { fresh: true });
+  }));
+  assert.equal(sent.length, 1);
+  assert.deepEqual([info.state, info.holderId], ["pending", "mpc_btn"]);
+});

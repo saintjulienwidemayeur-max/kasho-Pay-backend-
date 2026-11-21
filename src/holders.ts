@@ -169,10 +169,13 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   const now = new Date().toISOString();
   const missing = missingProfileFields(p);
   if (missing.length) {
+    console.error("[holder] NOT sent to Freda (", why, "):", userId.slice(0, 8), "- profile incomplete:", missing.join(", "));
     await saveRow(row, userId, mode, { last_attempt_at: now, verification_status: "needs_profile", failure_reason: null });
     return none("needs_profile", `Please complete your profile: ${missing.join(", ")}.`, missing);
   }
   const fail = async (reason: string, holderId: string | null = row?.freda_holder_id ?? null): Promise<HolderInfo> => {
+    // Nothing (more) was sent to Freda: say it, with the reason, so the logs always tell whether a holder went out.
+    console.error("[holder] NOT sent to Freda (", why, "):", userId.slice(0, 8), "-", reason.slice(0, 200));
     await saveRow(row, userId, mode, { last_attempt_at: now, verification_status: "failed", failure_reason: reason });
     await announce(userId, row?.verification_status, "failed");
     return { state: "failed", reason, missing: [], holderId, canRetry: true };
@@ -397,7 +400,9 @@ export async function enrollMissingHolders(limit = 3) {
   const { data: verified } = await L.db.from("profiles").select("id").eq("kyc_status", "verified").order("updated_at", { ascending: false }).limit(2000);
   const never = (verified ?? []).map((v: any) => String(v.id)).filter((id: string) => !enrolled.has(id) && !recent.has(id));
   const staleSet = new Set(stale);
-  const todo = [...new Set([...legacy, ...never, ...stale])].slice(0, limit);
+  const all = [...new Set([...legacy, ...never, ...stale])];
+  const todo = all.slice(0, limit);
+  if (all.length) console.log(`[holder] backfill round: ${all.length} to send (earlier versions ${legacy.length}, never registered ${never.length}, waiting over 6 h ${stale.length}), sending ${todo.length} now, ${recent.size} tried less than 6 h ago`);
   for (const id of todo) {
     try { await enrollHolder(id, "backfill", { fresh: !staleSet.has(id) }); } catch (e) { console.error("[holder] backfill", id.slice(0, 8), (e as Error).message); }
   }
@@ -439,4 +444,36 @@ export async function handleHolderEvent(type: string, d: any) {
     console.log("[holder]", type, holderId, row.verification_status ?? "-", "->", next, reason ? String(reason).slice(0, 160) : "");
     await announce(String(row.user_id), row.verification_status, verified ? "ready" : "failed");
   }
+}
+
+// ------------------------------------------------------------------ what the admin site shows
+export type HolderOverviewRow = {
+  userId: string; name: string; holderId: string | null; email: string | null;
+  /** none (never sent), needs_profile, submitted (sent, waiting for the program), verified, failed */
+  status: string; reason: string | null; sentAt: string | null; lastAttemptAt: string | null; checkedAt: string | null;
+};
+
+/** Every customer whose KYC is verified, with where their card holder is. Newest KYC first, at most 500. */
+export async function holderOverview(): Promise<{ mode: string; total: number; counts: Record<string, number>; items: HolderOverviewRow[] }> {
+  const mode = fredaConfigured() ? fredaMode() : "sandbox";
+  const { data: profiles, error } = await L.db.from("profiles").select("id, display_name, first_name, last_name, username").eq("kyc_status", "verified").order("updated_at", { ascending: false }).limit(500);
+  if (error) throw error;
+  const { data: holders, error: hErr } = await L.db.from("card_holders").select("*").eq("mode", mode).order("created_at", { ascending: false });
+  if (hErr) throw hErr;
+  const byUser = new Map<string, any>();
+  for (const h of holders ?? []) if (!byUser.has(h.user_id)) byUser.set(h.user_id, h);
+  const items: HolderOverviewRow[] = (profiles ?? []).map((p: any) => {
+    const h = byUser.get(p.id);
+    const sent = !!h?.program_enrolled_at && !!h?.freda_holder_id;
+    const vs = String(h?.verification_status ?? "");
+    const status = !h ? "none" : vs === "verified" ? "verified" : vs === "failed" ? "failed" : vs === "needs_profile" ? "needs_profile" : sent ? "submitted" : "none";
+    return {
+      userId: String(p.id), name: String(p.display_name || `${p.first_name ?? ""} ${p.last_name ?? ""}`.trim() || `@${p.username}`),
+      holderId: h?.freda_holder_id ?? null, email: h?.email ?? null, status, reason: h?.failure_reason ?? null,
+      sentAt: h?.program_enrolled_at ?? null, lastAttemptAt: h?.last_attempt_at ?? null, checkedAt: h?.checked_at ?? null,
+    };
+  });
+  const counts: Record<string, number> = { none: 0, needs_profile: 0, submitted: 0, verified: 0, failed: 0 };
+  for (const i of items) counts[i.status] = (counts[i.status] ?? 0) + 1;
+  return { mode, total: items.length, counts, items };
 }
