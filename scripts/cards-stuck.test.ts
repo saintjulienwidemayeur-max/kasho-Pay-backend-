@@ -865,3 +865,37 @@ test("pointing the webhook at this server saves the new secret, checks it, and t
   assert.equal(db.table("card_holders")[0]!.verification_status, "submitted", "it will be submitted again, so Freda sends its decision to the right address");
   assert.equal(db.table("app_settings").find((r) => r.key === "freda_webhook_secret")!.value.secret, "whsec_brandnewsecret99");
 });
+
+test("a holder whose ID could not be submitted keeps what Freda said (shown in the admin); one Freda says is already verified becomes verified; an error never makes an existing holder 'refused'", async () => {
+  assert.equal(H.saysAlreadyVerified(fredaErr(409, "HOLDER_ALREADY_VERIFIED", "x")), true);
+  assert.equal(H.saysAlreadyVerified(fredaErr(400, "X", "Le titulaire est déjà vérifié")), true);
+  assert.equal(H.saysAlreadyVerified(fredaErr(400, "X", "photo coupée")), false);
+  assert.match(H.describeAnswer({ restarted: false, message: "nothing to do" }), /message=nothing to do/);
+
+  // 1) a refusal Freda words its own way: the holder stays waiting, the note is kept
+  const db = world({ card_holders: [holderRow({ verification_status: "submitted", last_attempt_at: iso(3_600_000), program_enrolled_at: iso(3_600_000) })] });
+  await inWorld(db, () => withDeps({}, async () => {
+    freda.restartHolderVerification = (async () => { throw fredaErr(409, "HOLDER_BUSY", "verification in progress", "POST /v1/cards/holder-profile"); }) as any;
+    assert.equal((await H.enrollHolder(USER, "backfill", { fresh: false })).state, "pending");
+  }));
+  const row = db.table("card_holders")[0]!;
+  assert.deepEqual([row.verification_status, row.failure_reason], ["submitted", "409 HOLDER_BUSY: verification in progress"]);
+  assert.equal((await inWorld(db, () => H.holderOverview()) as any).items[0].reason, "409 HOLDER_BUSY: verification in progress", "the admin sees it");
+
+  // 2) Freda says it is already verified
+  const db2 = world({ card_holders: [holderRow({ verification_status: "submitted", last_attempt_at: iso(3_600_000), program_enrolled_at: iso(3_600_000) })] });
+  await inWorld(db2, () => withDeps({}, async () => {
+    freda.restartHolderVerification = (async () => { throw fredaErr(409, "HOLDER_ALREADY_VERIFIED", "already verified", "POST /v1/cards/holder-profile"); }) as any;
+    assert.equal((await H.enrollHolder(USER, "backfill", { fresh: false })).state, "ready");
+  }));
+  assert.equal(db2.table("card_holders")[0]!.verification_status, "verified");
+  assert.deepEqual(notifications(db2), ["Card profile verified"]);
+
+  // 3) an answer without restarted: true is kept as a note too
+  const db3 = world({ card_holders: [holderRow({ verification_status: "submitted", last_attempt_at: iso(3_600_000), program_enrolled_at: iso(3_600_000) })] });
+  await inWorld(db3, () => withDeps({}, async () => {
+    freda.restartHolderVerification = (async () => ({ restarted: false, message: "no change" })) as any;
+    await H.enrollHolder(USER, "backfill", { fresh: false });
+  }));
+  assert.match(db3.table("card_holders")[0]!.failure_reason, /message=no change/);
+});

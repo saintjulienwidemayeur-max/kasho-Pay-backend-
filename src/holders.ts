@@ -154,6 +154,23 @@ export function stateOfRow(status: unknown): "pending" | "ready" | "failed" {
   return status === "verified" ? "ready" : status === "failed" ? "failed" : "pending";
 }
 
+/** A Freda answer or error that says the holder is already verified / accepted (there is nothing to submit): then it is verified. */
+export function saysAlreadyVerified(x: unknown): boolean {
+  const text = x instanceof FredaError ? `${x.code} ${x.message}` : typeof x === "string" ? x : (() => { try { return JSON.stringify(x ?? ""); } catch { return ""; } })();
+  return /ALREADY_(VERIFIED|ACCEPTED|APPROVED|ENROLLED_IN_PROGRAM)|d[ée]j[àa] (v[ée]rifi|accept|approuv|valid)|already (verified|accepted|approved)/i.test(text);
+}
+
+/** What Freda answered, in a few words for the admin (never personal data): the error, or the words of the answer. */
+export function describeAnswer(x: unknown): string {
+  if (x instanceof FredaError) return `${x.status} ${x.code}: ${x.message}`.slice(0, 220);
+  if (x && typeof x === "object") {
+    const o = x as Record<string, unknown>;
+    const words = ["message", "reason", "status", "state", "error", "code", "restarted", "verification_status"].filter((k) => o[k] !== undefined && typeof o[k] !== "object").map((k) => `${k}=${String(o[k]).slice(0, 60)}`);
+    return `answered without restarted: true (${words.join(", ") || Object.keys(o).join(",") || "empty"})`.slice(0, 220);
+  }
+  return String(x ?? "no answer").slice(0, 220);
+}
+
 /** The customer's words for holder.rejected (Freda's reason, when it gives one, is added as it is). */
 export function rejectedMessage(reason: string | null | undefined): string {
   const r = String(reason ?? "").trim().replace(/\s+/g, " ").replace(/[.\s]+$/, "").slice(0, 200);
@@ -258,10 +275,16 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   let tagged = false;
   let res: any;
   /** Submits the ID photos for verification (POST /v1/cards/holder-profile + restart_verification): Freda answers `restarted: true`. */
+  let note: string | null = null; // what Freda said when the ID could not be submitted: shown in the admin
+  let alreadyVerified = false;
   const submitDocs = async (mail: string) => {
     const r: any = await freda.restartHolderVerification({ ...body, email: mail });
     const ok = r?.restarted === true;
-    if (!ok) console.error("[holder] POST /v1/cards/holder-profile did not answer restarted: true (", why, "):", userId.slice(0, 8), "fields:", Object.keys(r ?? {}).join(","));
+    if (!ok) {
+      note = describeAnswer(r);
+      if (saysAlreadyVerified(r)) alreadyVerified = true;
+      console.error("[holder] POST /v1/cards/holder-profile did not answer restarted: true (", why, "):", userId.slice(0, 8), note);
+    }
     return { r, ok };
   };
   const restartIt = async (mail: string) => {
@@ -315,11 +338,20 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
       return { state: "pending", reason: HOLDER_PENDING_MESSAGE, missing: [], holderId: row?.freda_holder_id ?? null, canRetry: false };
     }
     const fe = e instanceof FredaError ? e : null;
-    if (fe?.code === "HOLDER_VERIFICATION_LIMIT" && hadHolder) {
-      // Freda allows 5 verifications per 24 h: the holder is fine, it is tried again later.
-      await saveRow(row, userId, mode, { last_attempt_at: now });
-      console.error("[holder] verification limit reached for", userId.slice(0, 8), "(5 per 24 h): tried again later");
-      return { state: "pending", reason: HOLDER_PENDING_MESSAGE, missing: [], holderId: row?.freda_holder_id ?? null, canRetry: false };
+    if (hadHolder && fe && saysAlreadyVerified(fe)) {
+      // Freda says this holder is already verified: nothing to submit.
+      await saveRow(row, userId, mode, { last_attempt_at: now, verification_status: "verified", failure_reason: null, checked_at: now });
+      console.log("[holder] Freda says", row.freda_holder_id, "is already verified:", describeAnswer(fe));
+      await announce(userId, row?.verification_status, "ready");
+      return { state: "ready", reason: null, missing: [], holderId: row.freda_holder_id, canRetry: false };
+    }
+    if (hadHolder && fe && (fe.code === "HOLDER_VERIFICATION_LIMIT" || !HOLDER_ERRORS[fe.code])) {
+      // An existing holder is never "refused" because the submission failed (the limit of 5 per 24 h, a refusal Freda words its own way...):
+      // it stays waiting, the admin sees what Freda said, and it is tried again later.
+      const why2 = describeAnswer(fe);
+      await saveRow(row, userId, mode, { last_attempt_at: now, failure_reason: why2 });
+      console.error("[holder] the ID of", row.freda_holder_id, "was NOT submitted (", why, "):", why2, "- tried again later");
+      return { state: "pending", reason: HOLDER_PENDING_MESSAGE, missing: [], holderId: row.freda_holder_id, canRetry: false };
     }
     console.error("[holder] POST /v1/cards/holders refused (", why, "):", userId.slice(0, 8), fe?.status, fe?.code, String(fe?.message ?? (e as Error).message).slice(0, 200));
     return fail((fe && HOLDER_ERRORS[fe.code]) || HOLDER_FAILED_MESSAGE);
@@ -339,8 +371,9 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
     try {
       docsSent = (await submitDocs(String(body["email"]))).ok;
     } catch (e) {
-      const fe = e instanceof FredaError ? e : null;
-      console.error("[holder] the ID of", holderId, "was NOT submitted (", why, "):", fe?.status, fe?.code, String(fe?.message ?? (e as Error).message).slice(0, 200), "- it is tried again later");
+      note = describeAnswer(e);
+      if (saysAlreadyVerified(e)) alreadyVerified = true;
+      console.error("[holder] the ID of", holderId, "was NOT submitted (", why, "):", note, "- it is tried again later");
     }
   }
   // The POST answer may not say yet what the new issuer thinks: read the holder.
@@ -349,12 +382,13 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   let st: { state: "pending" | "ready" | "failed"; reason: string | null } = holderId ? readHolderState(h ?? {}) : { state: "pending", reason: null };
   // holder.verified / holder.rejected can arrive before this row was saved: it was kept aside.
   const early = holderId ? takeEarly(holderId) : null;
+  if (alreadyVerified && st.state !== "failed") st = { state: "ready", reason: null };
   if (early && st.state !== "failed") st = early.verified ? { state: "ready", reason: null } : { state: "failed", reason: rejectedMessage(early.reason) };
   const saved = await saveRow(row, userId, mode, {
     freda_holder_id: holderId, email: String(body["email"]), first_name: p.first_name, last_name: p.last_name, dob: p.date_of_birth, country, id_number: encryptField(idNumber),
     phone_code: phoneCode, phone_number: phone, address_street: p.address_street, address_city: p.address_city, address_state: p.address_state,
     address_postal_code: p.address_postal_code, status: String(h?.status ?? "pending"), identity_sent: true,
-    verification_status: st.state === "ready" ? "verified" : st.state === "pending" ? (docsSent ? "docs_sent" : "submitted") : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : null,
+    verification_status: st.state === "ready" ? "verified" : st.state === "pending" ? (docsSent ? "docs_sent" : "submitted") : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : st.state === "pending" && !docsSent ? note : null,
     program_enrolled_at: now, last_attempt_at: now, checked_at: now,
   });
   // A holder.verified / holder.rejected that arrived while the row was being saved (the webhook can come before Freda's answer is back).
