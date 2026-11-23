@@ -10,6 +10,7 @@ import { isSuspended } from "./security.js";
 import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaBlocked, mfaEndpointRequired, adminRequire2fa, passwordIsValid, recordStepUpFailure, stepUpLocked, tokenAal } from "./stepup.js";
 import { loadRate } from "./admin.js";
 import * as H from "./holders.js";
+import { startWebhookWatch } from "./webhookcheck.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { initPush, runMorningGreetings } from "./push.js";
@@ -53,6 +54,8 @@ app.post("/api/webhooks/freda", express.raw({ type: "*/*", limit: "1mb" }), asyn
   const secret = process.env["FREDA_WEBHOOK_SECRET"] ?? "";
   const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "";
   if (!secret || secret.includes("REPLACE_ME") || !verifyWebhookSignature(raw, req.header("x-freda-signature") ?? null, secret)) {
+    // Payments and cards are also settled by polling, so a refused webhook used to go unnoticed: but a card holder's decision only comes by webhook.
+    console.error("[freda webhook] 401:", !secret || secret.includes("REPLACE_ME") ? "FREDA_WEBHOOK_SECRET is not set" : "the signature does not match FREDA_WEBHOOK_SECRET (the secret of another webhook?)");
     return res.status(401).send("Invalid signature");
   }
   let evt: any;
@@ -64,6 +67,7 @@ app.post("/api/webhooks/freda", express.raw({ type: "*/*", limit: "1mb" }), asyn
   const eventId: string = req.header("x-freda-event-id") ?? evt?.id ?? "";
   const type: string = evt?.event ?? "";
   const d = evt?.data ?? {};
+  console.log("[freda webhook]", type || "(no event)", String(d?.id ?? d?.card_id ?? "").slice(0, 40));
 
   // Duplicate deliveries are possible: process each event id only once.
   if (eventId) {
@@ -168,7 +172,7 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   adminSetRate: { windowMs: MIN, max: 5 },
   adminReplySupport: { windowMs: MIN, max: 30 },
   adminSendHolder: { windowMs: MIN, max: 10 },
-  adminMarkHolderVerified: { windowMs: MIN, max: 20 },
+  adminWebhookStatus: { windowMs: MIN, max: 6 },
   adminCreateAdmin: { windowMs: HOUR, max: 10 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();
@@ -391,6 +395,7 @@ app.listen(port, () => {
   }
   setInterval(reconcile, 30_000);
   void loadRate();
+  startWebhookWatch(); // asks Freda for its webhook and makes it send a signed test: says so in the logs when this server refuses it
   setInterval(() => { void loadRate(); }, 30_000).unref(); // the exchange rate an administrator sets (also picked up by other instances)
   // Render's free plan puts a service to sleep after ~15 minutes without a request from outside. While it is awake it asks for its own
   // public address every 5 minutes (Render sets RENDER_EXTERNAL_URL; KEEP_ALIVE_URL overrides it, KEEP_ALIVE=false turns it off).

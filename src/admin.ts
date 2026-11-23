@@ -12,6 +12,7 @@ import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOpe
 import type { Ctx, Handler } from "./types.js";
 import { adminRequire2fa } from "./stepup.js";
 import * as H from "./holders.js";
+import { checkFredaWebhook, lastWebhookCheck } from "./webhookcheck.js";
 
 const hasTotp = (u: any): boolean => (u?.factors ?? []).some((f: any) => f?.factor_type === "totp" && f?.status === "verified");
 
@@ -673,17 +674,12 @@ export const adminHandlers: Record<string, Handler> = {
     },
   },
 
-  /**
-   * Marks a customer's card holder as verified by the new card program, when Freda's dashboard says "Accepté" but the holder.verified
-   * message did not get here. The customer is told and can create a card. Super administrator only; written to the audit log.
-   */
-  adminMarkHolderVerified: {
-    schema: z.object({ userId: uuid }),
+  /** Is Freda's webhook reaching this server? (the last check, or a new one with `refresh`: Freda sends a signed test event) */
+  adminWebhookStatus: {
+    schema: z.object({ refresh: z.boolean().optional() }).passthrough(),
     run: async (d, c) => {
-      await requireAdmin(c, "super");
-      const r = await H.markHolderVerified(d.userId);
-      await audit(c, "holder_marked_verified", { holderId: r.holderId }, d.userId);
-      return { ok: true as const, holderId: r.holderId };
+      await requireAdmin(c);
+      return (d.refresh ? await checkFredaWebhook() : null) ?? lastWebhookCheck() ?? (await checkFredaWebhook());
     },
   },
 

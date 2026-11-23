@@ -116,6 +116,10 @@ export const freda = {
     call("POST", "/v1/payouts", b),
   getPayout: (id: string) => call("GET", `/v1/payouts/${encodeURIComponent(id)}`),
   balance: () => call("GET", "/v1/balance"),
+  /** GET /v1/webhooks: the endpoint Freda sends to ({ endpoint: { url, active } } or null). */
+  webhookEndpoint: () => call("GET", "/v1/webhooks"),
+  /** POST /v1/webhooks/test: Freda sends a signed webhook.test to that URL and says whether it was answered 2xx ({ sent, http_status, reason }). */
+  testWebhook: () => call("POST", "/v1/webhooks/test"),
   /** Cards issuer wallet: balance, guarantee deposit (always locked), spendable, low_balance. */
   masterWallet: () => call("GET", "/v1/master-wallet"),
 

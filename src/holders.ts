@@ -112,6 +112,43 @@ export function readHolderState(h: any): { state: "pending" | "failed"; reason: 
   return { state: "pending", reason };
 }
 
+/**
+ * What GET /v1/cards/holders/:id can say about the NEW PROGRAM, when Freda gives it (a field whose name mentions the program: "program",
+ * "new_program", "program_status"...): accepted / refused. Only an explicit word counts: "enrolled" or the old issuer's
+ * `verification.ready_for_cards` say nothing about the new program. Null when the answer has no such field.
+ */
+export function readProgramDecision(h: any): { verified: boolean; reason: string | null } | null {
+  const seen = new Set<unknown>();
+  let found: { verified: boolean; reason: string | null } | null = null;
+  const word = (v: unknown): boolean | null => {
+    if (typeof v === "boolean") return v;
+    const t = String(v ?? "").toLowerCase();
+    if (/(^|[^a-z])(accept|approved|verified|valid|ok|ready|enrolled)/.test(t) && !/(not|non|un|in)[ _-]?(accept|approved|verified|valid)/.test(t)) return true;
+    if (/refus|reject|declin|denied|fail|datanot|not[ _-]?(accept|approved|verified)|invalid/.test(t)) return false;
+    return null;
+  };
+  const walk = (o: any, depth: number) => {
+    if (!o || typeof o !== "object" || seen.has(o) || depth > 2 || found) return;
+    seen.add(o);
+    for (const [k, v] of Object.entries(o)) {
+      if (found) return;
+      if (/program/i.test(k) && !/(reason|error|message|at|date|id|name)$/i.test(k)) {
+        if (v && typeof v === "object") {
+          const inner: any = v;
+          const w = word(inner.status ?? inner.state ?? inner.result ?? inner.decision ?? inner.accepted ?? inner.verified);
+          if (w !== null) { found = { verified: w, reason: w ? null : String(inner.reason ?? inner.failure_reason ?? inner.error ?? "").slice(0, 200) || null }; return; }
+        } else {
+          const w = word(v);
+          if (w !== null) { found = { verified: w, reason: w ? null : String(o[`${k}_reason`] ?? o["program_reason"] ?? o["failure_reason"] ?? "").slice(0, 200) || null }; return; }
+        }
+      }
+      if (v && typeof v === "object") walk(v, depth + 1);
+    }
+  };
+  walk(h, 0);
+  return found;
+}
+
 /** card_holders.verification_status -> what the customer sees. Only holder.verified makes a holder ready. */
 export function stateOfRow(status: unknown): "pending" | "ready" | "failed" {
   return status === "verified" ? "ready" : status === "failed" ? "failed" : "pending";
@@ -351,16 +388,22 @@ async function recheck(row: any, userId: string): Promise<any> {
     lastSeenFields.set(String(row.freda_holder_id), sig);
     console.log("[holder] Freda says about", row.freda_holder_id, "- fields:", Object.keys(ho).join(","), "| status fields:", seen.join(", ") || "-");
   }
-  // GET can only say that the holder failed; "accepted by the program" comes by webhook, so nothing else is changed here.
-  if (st.state === "failed" && row.verification_status !== "failed") {
+  // GET says that the holder failed, and (when Freda gives a program field) whether the new program accepted it. Otherwise only the
+  // holder.verified / holder.rejected webhook says it, and nothing else is changed here.
+  const program = row.verification_status === "verified" ? null : readProgramDecision(ho);
+  if (program?.verified) {
+    patch["verification_status"] = "verified";
+    patch["failure_reason"] = null;
+  } else if ((program && !program.verified) || (st.state === "failed" && row.verification_status !== "failed")) {
     patch["verification_status"] = "failed";
-    patch["failure_reason"] = st.reason ?? HOLDER_FAILED_MESSAGE;
+    patch["failure_reason"] = program && !program.verified ? rejectedMessage(program.reason) : (st.reason ?? HOLDER_FAILED_MESSAGE);
   }
   const { data, error } = await L.db.from("card_holders").update(patch).eq("id", row.id).select("*").single();
   if (error) throw error;
   if (patch["verification_status"]) {
-    console.log("[holder]", row.freda_holder_id, row.verification_status, "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
-    await announce(userId, row.verification_status, st.state);
+    const next = String(patch["verification_status"]);
+    console.log("[holder]", row.freda_holder_id, row.verification_status, "->", next, "(read at Freda)", st.reason ? String(st.reason).slice(0, 160) : "");
+    await announce(userId, row.verification_status, next === "verified" ? "ready" : next);
   }
   return data;
 }
@@ -398,22 +441,6 @@ export async function retryHolder(userId: string): Promise<HolderInfo> {
   return enrollHolder(userId, "customer", { fresh: false });
 }
 
-/**
- * An administrator marks the customer's holder as verified by the new program (Freda's dashboard says "Accepté") when the
- * holder.verified message did not get here. The customer is told and can create a card.
- */
-export async function markHolderVerified(userId: string): Promise<{ holderId: string | null }> {
-  const mode = fredaConfigured() ? fredaMode() : "sandbox";
-  const row = await latestRow(userId, mode);
-  if (!row?.freda_holder_id) throw new L.AppError("This customer has no card holder at Freda yet.");
-  if (row.verification_status === "verified") return { holderId: row.freda_holder_id };
-  const { error } = await L.db.from("card_holders").update({ verification_status: "verified", failure_reason: null, checked_at: new Date().toISOString() }).eq("id", row.id);
-  if (error) throw error;
-  console.log("[holder] marked verified by an administrator:", row.freda_holder_id, "was", row.verification_status ?? "-");
-  await announce(userId, row.verification_status, "ready");
-  return { holderId: row.freda_holder_id };
-}
-
 /** The card was refused because the holder is not ready after all: show "being verified" again and let the background pass check it. */
 export async function markHolderPending(userId: string) {
   const row = fredaConfigured() ? await latestRow(userId, fredaMode()) : null;
@@ -424,7 +451,7 @@ export async function markHolderPending(userId: string) {
 /** Asks Freda about holders that are still being verified (oldest check first). */
 export async function refreshPendingHolders(limit = 10) {
   if (!fredaConfigured()) return;
-  const { data, error } = await L.db.from("card_holders").select("*").eq("mode", fredaMode()).in("verification_status", ["pending", "submitted"])
+  const { data, error } = await L.db.from("card_holders").select("*").eq("mode", fredaMode()).in("verification_status", ["pending", "submitted", "docs_sent"])
     .not("freda_holder_id", "is", null).order("checked_at", { ascending: true, nullsFirst: true }).limit(limit);
   if (error) { if (!/verification_status|checked_at/.test(error.message)) console.error("[holder] could not list pending holders:", error.message); return; }
   for (const row of data ?? []) {

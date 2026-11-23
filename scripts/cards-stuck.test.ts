@@ -765,19 +765,6 @@ test("holder.verified for a holder that no row has (the customer's other holder 
   assert.equal(db2.table("card_holders")[0]!.freda_holder_id, "mpc_1");
 });
 
-test("an administrator can mark a holder verified (Freda says 'Accepté' but the webhook did not arrive): the customer is told and can create a card", async () => {
-  const db = world({ card_holders: [holderRow({ verification_status: "docs_sent" })] });
-  await inWorld(db, async () => {
-    assert.equal((await H.holderInfo(USER)).state, "pending");
-    await H.markHolderVerified(USER);
-    assert.equal((await H.holderInfo(USER)).state, "ready");
-    await H.markHolderVerified(USER); // twice: nothing more
-  });
-  assert.deepEqual(notifications(db), ["Card profile verified"], "told once");
-  const none = world({ card_holders: [] });
-  await assert.rejects(() => inWorld(none, () => H.markHolderVerified(USER)), /no card holder at Freda/);
-});
-
 test("a holder.verified that arrives while the registration is being saved is not lost", async () => {
   const db = world({ card_holders: [] });
   await inWorld(db, () => withDeps({}, async () => {
@@ -788,4 +775,42 @@ test("a holder.verified that arrives while the registration is being saved is no
     assert.equal((await H.enrollHolder(USER, "kyc")).state, "ready");
   }));
   assert.equal(db.table("card_holders")[0]!.verification_status, "verified");
+});
+
+test("the program decision is read from Freda's GET only when a field names the program with an explicit word", () => {
+  assert.deepEqual(H.readProgramDecision({ status: "enrolled", program_status: "accepted" }), { verified: true, reason: null });
+  assert.deepEqual(H.readProgramDecision({ status: "enrolled", new_program: { status: "Accepté" } }), { verified: true, reason: null });
+  assert.deepEqual(H.readProgramDecision({ program: { status: "rejected", reason: "dataNotReadable" } }), { verified: false, reason: "dataNotReadable" });
+  assert.equal(H.readProgramDecision({ program_status: "pending" }), null);
+  assert.equal(H.readProgramDecision({ status: "enrolled", verification: { ready_for_cards: true, tier: 2 } }), null, "the old issuer's verification says nothing about the new program");
+  assert.equal(H.readProgramDecision({ status: "enrolled" }), null);
+  assert.equal(H.readProgramDecision({ program_status: "not accepted" })!.verified, false);
+});
+
+test("holders waiting for the decision are asked at Freda every round; a program field that says accepted makes them verified at once, without the webhook", async () => {
+  const db = world({ card_holders: [holderRow({ verification_status: "docs_sent", checked_at: iso(120_000) })] });
+  let reads = 0;
+  await inWorld(db, async () => {
+    freda.getHolder = (async () => { reads++; return { holder: { id: "mpc_1", status: "enrolled" } }; }) as any;
+    await H.refreshPendingHolders();
+    assert.equal(db.table("card_holders")[0]!.verification_status, "docs_sent", "GET without a program field changes nothing");
+    freda.getHolder = (async () => { reads++; return { holder: { id: "mpc_1", status: "enrolled", program_status: "accepted" } }; }) as any;
+    await H.refreshPendingHolders();
+  });
+  assert.equal(reads, 2, "a docs_sent holder is polled");
+  assert.equal(db.table("card_holders")[0]!.verification_status, "verified");
+  assert.deepEqual(notifications(db), ["Card profile verified"]);
+});
+
+test("webhook check: no webhook, another URL, a refused test (401) and a working one are told apart", async () => {
+  const W = await import("../src/webhookcheck.js");
+  const ok = { url: "https://k.onrender.com/api/webhooks/freda", active: true, expectedUrl: "https://k.onrender.com/api/webhooks/freda", test: { sent: true, httpStatus: 200, reason: null } };
+  assert.equal(W.webhookProblem(ok), null);
+  assert.match(W.webhookProblem({ ...ok, url: null })!, /no webhook registered/);
+  assert.match(W.webhookProblem({ ...ok, active: false })!, /switched off/);
+  assert.match(W.webhookProblem({ ...ok, url: "https://old.example.com/api/webhooks/freda" })!, /sends to https:\/\/old/);
+  assert.match(W.webhookProblem({ ...ok, test: { sent: false, httpStatus: 401, reason: "Invalid signature" } })!, /REFUSED.*FREDA_WEBHOOK_SECRET/);
+  assert.match(W.webhookProblem({ ...ok, test: { sent: false, httpStatus: 502, reason: null } })!, /HTTP 502/);
+  assert.equal(W.expectedWebhookUrl({ RENDER_EXTERNAL_URL: "https://k.onrender.com/" } as any), "https://k.onrender.com/api/webhooks/freda");
+  assert.equal(W.expectedWebhookUrl({} as any), null);
 });
