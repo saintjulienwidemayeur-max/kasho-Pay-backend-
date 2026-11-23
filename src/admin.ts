@@ -12,6 +12,7 @@ import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOpe
 import type { Ctx, Handler } from "./types.js";
 import { adminRequire2fa } from "./stepup.js";
 import * as H from "./holders.js";
+import { PARTNER_OPERATIONS, PROFIT_KINDS, computeProfit, rowToPartnerRule } from "./profit.js";
 import { checkFredaWebhook, fixFredaWebhook, lastWebhookCheck } from "./webhookcheck.js";
 
 const hasTotp = (u: any): boolean => (u?.factors ?? []).some((f: any) => f?.factor_type === "totp" && f?.status === "verified");
@@ -695,6 +696,63 @@ export const adminHandlers: Record<string, Handler> = {
       const resubmitted = check.ok ? await H.resubmitWaitingHolders() : 0;
       await audit(c, "webhook_fixed", { url: check.url, ok: check.ok, resubmitted });
       return { check, resubmitted };
+    },
+  },
+
+  /**
+   * Benefits over the last `days` days: what customers paid in fees, minus what Freda charged. The charge is exact where it was recorded
+   * on the operation and estimated from the price list (below) for the rest: both are shown apart.
+   */
+  adminGetProfit: {
+    schema: z.object({ days: z.number().int().min(1).max(366).default(30) }),
+    run: async (d, c) => {
+      await requireAdmin(c);
+      const from = new Date(Date.now() - d.days * 24 * 3600_000).toISOString();
+      const rules = ((await q<any[]>(L.db.from("partner_costs").select("*").order("operation"))) ?? []).map(rowToPartnerRule);
+      // Pages of 1000 rows, at most 30 pages: a period with more says so (`truncated`) instead of showing a wrong total.
+      let truncated = false;
+      const txs: any[] = [];
+      for (let page = 0; page < 30; page++) {
+        const { data, error } = await L.db.from("transactions").select("kind, amount, fee, meta, created_at").in("kind", [...PROFIT_KINDS])
+          .eq("status", "completed").gte("created_at", from).order("created_at").range(page * 1000, page * 1000 + 999);
+        if (error) throw error;
+        txs.push(...(data ?? []));
+        if ((data ?? []).length < 1000) break;
+        if (page === 29) truncated = true;
+      }
+      const events: any[] = [];
+      for (let page = 0; page < 30; page++) {
+        const { data, error } = await L.db.from("card_events").select("type, amount").gte("created_at", from).order("created_at").range(page * 1000, page * 1000 + 999);
+        if (error) { if (missingAdminObject(error)) break; throw error; }
+        events.push(...(data ?? []));
+        if ((data ?? []).length < 1000) break;
+        if (page === 29) truncated = true;
+      }
+      const rate = getConfig().htgPerUsd;
+      return { period: { from, to: new Date().toISOString(), days: d.days }, rate, truncated, rules, ...computeProfit(txs, events, rules, rate) };
+    },
+  },
+
+  /** Edits what Freda charges us for one operation (the price list the estimates use). Super administrator; password asked again; audit log. */
+  adminSavePartnerCost: {
+    schema: z.object({
+      operation: z.enum(PARTNER_OPERATIONS),
+      percent: z.number().min(0).max(100), flatUsd: z.number().min(0).max(1000), flatHtg: z.number().min(0).max(100000),
+      thresholdUsd: z.number().min(0).max(100000).nullable().default(null), active: z.boolean().default(true),
+      note: z.string().trim().max(200).default(""), confirmPassword: z.string().optional(),
+    }),
+    run: async (d, c) => {
+      await requireAdmin(c, "super");
+      const { error } = await L.db.from("partner_costs").upsert({
+        operation: d.operation, percent: d.percent, flat_usd: d.flatUsd, flat_htg: d.flatHtg, threshold_usd: d.thresholdUsd, active: d.active, note: d.note, updated_by: c.userId,
+      }, { onConflict: "operation" });
+      if (error) {
+        if (missingAdminObject(error)) throw new L.AppError(NEEDS_MIGRATION);
+        throw error;
+      }
+      await audit(c, "partner_cost_saved", { operation: d.operation, percent: d.percent, flatUsd: d.flatUsd, flatHtg: d.flatHtg, thresholdUsd: d.thresholdUsd, active: d.active });
+      const rules = ((await q<any[]>(L.db.from("partner_costs").select("*").order("operation"))) ?? []).map(rowToPartnerRule);
+      return { rules };
     },
   },
 

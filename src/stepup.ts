@@ -21,6 +21,8 @@ export const STEP_UP: Record<string, { field: string; strip: boolean }> = {
   adminSetRate: { field: "confirmPassword", strip: true },
   adminCreateAdmin: { field: "confirmPassword", strip: true },
   adminFixWebhook: { field: "confirmPassword", strip: true },
+  // What Freda charges us feeds the benefit figures: password again.
+  adminSavePartnerCost: { field: "confirmPassword", strip: true },
 };
 
 /**
@@ -36,7 +38,7 @@ export const MFA_ENDPOINTS: ReadonlySet<string> = new Set([
   // admin panel (adminStatus is not here on purpose: the page uses it to explain what is missing before 2FA is set up)
   "adminOverview", "adminFredaFunds", "adminListUsers", "adminGetUser", "adminListCards", "adminGetCard",
   "adminAdjustBalance", "adminSetUserBlocked", "adminListTransactions", "adminListSupport", "adminListAudit",
-  "adminGetRate", "adminSetRate", "adminListAdmins", "adminCreateAdmin", "adminReplySupport", "adminListHolders", "adminSendHolder", "adminWebhookStatus", "adminFixWebhook",
+  "adminGetRate", "adminSetRate", "adminListAdmins", "adminCreateAdmin", "adminReplySupport", "adminListHolders", "adminSendHolder", "adminWebhookStatus", "adminFixWebhook", "adminGetProfit", "adminSavePartnerCost",
 ]);
 
 /** Defaults to TRUE: only an explicit "false" turns the wide enforcement off. */

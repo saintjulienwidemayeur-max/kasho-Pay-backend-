@@ -175,6 +175,8 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   adminSendHolder: { windowMs: MIN, max: 10 },
   adminWebhookStatus: { windowMs: MIN, max: 6 },
   adminFixWebhook: { windowMs: HOUR, max: 5 },
+  adminGetProfit: { windowMs: MIN, max: 20 },
+  adminSavePartnerCost: { windowMs: MIN, max: 20 },
   adminCreateAdmin: { windowMs: HOUR, max: 10 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();
