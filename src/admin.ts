@@ -673,6 +673,20 @@ export const adminHandlers: Record<string, Handler> = {
     },
   },
 
+  /**
+   * Marks a customer's card holder as verified by the new card program, when Freda's dashboard says "Accepté" but the holder.verified
+   * message did not get here. The customer is told and can create a card. Super administrator only; written to the audit log.
+   */
+  adminMarkHolderVerified: {
+    schema: z.object({ userId: uuid }),
+    run: async (d, c) => {
+      await requireAdmin(c, "super");
+      const r = await H.markHolderVerified(d.userId);
+      await audit(c, "holder_marked_verified", { holderId: r.holderId }, d.userId);
+      return { ok: true as const, holderId: r.holderId };
+    },
+  },
+
   adminListAudit: {
     schema: z.object({ page: z.number().int().min(1).max(100000).default(1), pageSize: z.number().int().min(10).max(100).default(50) }),
     run: async (d, c) => {

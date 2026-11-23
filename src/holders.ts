@@ -320,6 +320,13 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
     verification_status: st.state === "ready" ? "verified" : st.state === "pending" ? (docsSent ? "docs_sent" : "submitted") : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : null,
     program_enrolled_at: now, last_attempt_at: now, checked_at: now,
   });
+  // A holder.verified / holder.rejected that arrived while the row was being saved (the webhook can come before Freda's answer is back).
+  const late = holderId ? takeEarly(holderId) : null;
+  if (late && st.state !== "failed") {
+    const next = late.verified ? "verified" : "failed";
+    await L.db.from("card_holders").update({ verification_status: next, failure_reason: late.verified ? null : rejectedMessage(late.reason) }).eq("id", saved.id);
+    st = late.verified ? { state: "ready", reason: null } : { state: "failed", reason: rejectedMessage(late.reason) };
+  }
   console.log("[holder]", restart ? (restarted ? "ID submitted (verification restarted)" : "restart NOT confirmed by Freda") : `${tagged ? "registered with a tagged e-mail" : "registered"}, ID ${docsSent ? "submitted" : "NOT submitted yet"}`, `(${why})`, String(holderId ?? "?"), "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
   await announce(userId, row?.verification_status, st.state);
   return {
@@ -328,11 +335,22 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   };
 }
 
+const lastSeenFields = new Map<string, string>();
+
 /** Reads the holder again at Freda (pending holders) and saves what changed. */
 async function recheck(row: any, userId: string): Promise<any> {
   const g: any = await freda.getHolder(row.freda_holder_id);
   const st = readHolderState(g?.holder ?? g);
   const patch: Record<string, unknown> = { checked_at: new Date().toISOString(), status: String((g?.holder ?? g)?.status ?? row.status) };
+  // Once per holder and change: the fields Freda gives (names, and the short values that look like a status), to see whether GET says
+  // that the program accepted the holder. Never the personal data.
+  const ho = g?.holder ?? g ?? {};
+  const seen = Object.entries(ho).filter(([k, v]) => /program|verif|tier|kyc|state|status|accept|ready/i.test(k) && (v === null || ["string", "number", "boolean"].includes(typeof v) || typeof v === "object")).map(([k, v]) => `${k}=${typeof v === "object" && v ? JSON.stringify(v).slice(0, 80) : String(v).slice(0, 40)}`);
+  const sig = `${row.freda_holder_id}|${seen.join(",")}`;
+  if (lastSeenFields.get(String(row.freda_holder_id)) !== sig) {
+    lastSeenFields.set(String(row.freda_holder_id), sig);
+    console.log("[holder] Freda says about", row.freda_holder_id, "- fields:", Object.keys(ho).join(","), "| status fields:", seen.join(", ") || "-");
+  }
   // GET can only say that the holder failed; "accepted by the program" comes by webhook, so nothing else is changed here.
   if (st.state === "failed" && row.verification_status !== "failed") {
     patch["verification_status"] = "failed";
@@ -378,6 +396,22 @@ export async function retryHolder(userId: string): Promise<HolderInfo> {
   if (cur.state === "needs_kyc" || cur.state === "needs_profile" || cur.state === "ready" || cur.state === "pending") return cur;
   if (!cur.canRetry) throw new L.AppError("Please wait a few minutes before trying again.");
   return enrollHolder(userId, "customer", { fresh: false });
+}
+
+/**
+ * An administrator marks the customer's holder as verified by the new program (Freda's dashboard says "Accepté") when the
+ * holder.verified message did not get here. The customer is told and can create a card.
+ */
+export async function markHolderVerified(userId: string): Promise<{ holderId: string | null }> {
+  const mode = fredaConfigured() ? fredaMode() : "sandbox";
+  const row = await latestRow(userId, mode);
+  if (!row?.freda_holder_id) throw new L.AppError("This customer has no card holder at Freda yet.");
+  if (row.verification_status === "verified") return { holderId: row.freda_holder_id };
+  const { error } = await L.db.from("card_holders").update({ verification_status: "verified", failure_reason: null, checked_at: new Date().toISOString() }).eq("id", row.id);
+  if (error) throw error;
+  console.log("[holder] marked verified by an administrator:", row.freda_holder_id, "was", row.verification_status ?? "-");
+  await announce(userId, row.verification_status, "ready");
+  return { holderId: row.freda_holder_id };
 }
 
 /** The card was refused because the holder is not ready after all: show "being verified" again and let the background pass check it. */

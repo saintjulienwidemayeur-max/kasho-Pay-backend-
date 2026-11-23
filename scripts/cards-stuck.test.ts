@@ -764,3 +764,28 @@ test("holder.verified for a holder that no row has (the customer's other holder 
   });
   assert.equal(db2.table("card_holders")[0]!.freda_holder_id, "mpc_1");
 });
+
+test("an administrator can mark a holder verified (Freda says 'Accepté' but the webhook did not arrive): the customer is told and can create a card", async () => {
+  const db = world({ card_holders: [holderRow({ verification_status: "docs_sent" })] });
+  await inWorld(db, async () => {
+    assert.equal((await H.holderInfo(USER)).state, "pending");
+    await H.markHolderVerified(USER);
+    assert.equal((await H.holderInfo(USER)).state, "ready");
+    await H.markHolderVerified(USER); // twice: nothing more
+  });
+  assert.deepEqual(notifications(db), ["Card profile verified"], "told once");
+  const none = world({ card_holders: [] });
+  await assert.rejects(() => inWorld(none, () => H.markHolderVerified(USER)), /no card holder at Freda/);
+});
+
+test("a holder.verified that arrives while the registration is being saved is not lost", async () => {
+  const db = world({ card_holders: [] });
+  await inWorld(db, () => withDeps({}, async () => {
+    freda.createHolder = (async () => ({ id: "mpc_race", holder: { id: "mpc_race", status: "enrolled" } })) as any;
+    // the webhook comes while Freda's answer to the ID submission is still on its way back
+    freda.restartHolderVerification = (async () => { await H.handleHolderEvent("holder.verified", { id: "mpc_race" }); return { restarted: true }; }) as any;
+    freda.getHolder = (async () => ({ holder: { status: "enrolled" } })) as any;
+    assert.equal((await H.enrollHolder(USER, "kyc")).state, "ready");
+  }));
+  assert.equal(db.table("card_holders")[0]!.verification_status, "verified");
+});
