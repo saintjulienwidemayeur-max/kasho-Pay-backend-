@@ -3,6 +3,8 @@
 // goes unnoticed for them and blocks the holders. This asks Freda for the registered endpoint and makes Freda send a signed test event
 // (POST /v1/webhooks/test: it says whether this server answered 2xx), at startup and every 6 hours, and says it loudly in the logs.
 import { FredaError, freda, fredaConfigured, fredaMode } from "./freda.js";
+import * as L from "./ledger.js";
+import { saveWebhookSecret } from "./webhooksecret.js";
 
 export type WebhookCheck = {
   checkedAt: string; mode: "live" | "sandbox" | null;
@@ -69,4 +71,22 @@ export async function checkFredaWebhook(): Promise<WebhookCheck | null> {
 export function startWebhookWatch() {
   setTimeout(() => { void checkFredaWebhook(); }, 25_000).unref();
   setInterval(() => { void checkFredaWebhook(); }, 6 * 3600_000).unref();
+}
+
+/**
+ * Points Freda's webhook at THIS server: registers the URL (Freda replaces the endpoint and gives a new secret, shown once), keeps that
+ * secret here, then makes Freda send a signed test event to check that it works. The caller then submits again the holders that wait
+ * (their holder.verified went to the old address and will not be sent again).
+ */
+export async function fixFredaWebhook(userId: string): Promise<WebhookCheck> {
+  if (!fredaConfigured()) throw new L.AppError("The card service is not configured.");
+  const url = expectedWebhookUrl();
+  if (!url) throw new L.AppError("This server does not know its public address: set RENDER_EXTERNAL_URL or PUBLIC_URL (https://...).");
+  const r: any = await freda.registerWebhook(url);
+  const secret = String(r?.secret ?? r?.data?.secret ?? "");
+  await saveWebhookSecret(secret, userId);
+  console.log("[webhook] Freda's webhook now points at", url, "(new secret kept by the server)");
+  const check = await checkFredaWebhook();
+  if (!check) throw new L.AppError("Freda's webhook could not be checked.");
+  return check;
 }

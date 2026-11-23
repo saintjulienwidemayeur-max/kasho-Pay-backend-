@@ -11,6 +11,7 @@ import { MFA_REQUIRED_ERROR, STEP_UP, clearStepUpFailures, hasVerifiedTotp, mfaB
 import { loadRate } from "./admin.js";
 import * as H from "./holders.js";
 import { startWebhookWatch } from "./webhookcheck.js";
+import { loadStoredWebhookSecret, webhookSecrets } from "./webhooksecret.js";
 import { diditConfigured, verifyDiditWebhook } from "./didit.js";
 import { handlers, type Ctx } from "./routes.js";
 import { initPush, runMorningGreetings } from "./push.js";
@@ -51,11 +52,11 @@ app.get("/health", (_req, res) => {
 
 // ---------------------------------------------------------------- Freda webhook (raw body needed for the signature)
 app.post("/api/webhooks/freda", express.raw({ type: "*/*", limit: "1mb" }), async (req: Request, res: Response) => {
-  const secret = process.env["FREDA_WEBHOOK_SECRET"] ?? "";
+  const secrets = webhookSecrets(); // FREDA_WEBHOOK_SECRET and the secret kept by the last registration from the admin site
   const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "";
-  if (!secret || secret.includes("REPLACE_ME") || !verifyWebhookSignature(raw, req.header("x-freda-signature") ?? null, secret)) {
+  if (!secrets.length || !secrets.some((s) => verifyWebhookSignature(raw, req.header("x-freda-signature") ?? null, s))) {
     // Payments and cards are also settled by polling, so a refused webhook used to go unnoticed: but a card holder's decision only comes by webhook.
-    console.error("[freda webhook] 401:", !secret || secret.includes("REPLACE_ME") ? "FREDA_WEBHOOK_SECRET is not set" : "the signature does not match FREDA_WEBHOOK_SECRET (the secret of another webhook?)");
+    console.error("[freda webhook] 401:", !secrets.length ? "FREDA_WEBHOOK_SECRET is not set" : "the signature does not match FREDA_WEBHOOK_SECRET (the secret of another webhook?)");
     return res.status(401).send("Invalid signature");
   }
   let evt: any;
@@ -173,6 +174,7 @@ const endpointLimits: Record<string, { windowMs: number; max: number }> = {
   adminReplySupport: { windowMs: MIN, max: 30 },
   adminSendHolder: { windowMs: MIN, max: 10 },
   adminWebhookStatus: { windowMs: MIN, max: 6 },
+  adminFixWebhook: { windowMs: HOUR, max: 5 },
   adminCreateAdmin: { windowMs: HOUR, max: 10 },
 };
 const endpointLimiters = new Map<string, ReturnType<typeof createRateLimiter>>();
@@ -395,6 +397,8 @@ app.listen(port, () => {
   }
   setInterval(reconcile, 30_000);
   void loadRate();
+  void loadStoredWebhookSecret();
+  setInterval(() => { void loadStoredWebhookSecret(); }, 60_000).unref(); // also picked up by another instance
   startWebhookWatch(); // asks Freda for its webhook and makes it send a signed test: says so in the logs when this server refuses it
   setInterval(() => { void loadRate(); }, 30_000).unref(); // the exchange rate an administrator sets (also picked up by other instances)
   // Render's free plan puts a service to sleep after ~15 minutes without a request from outside. While it is awake it asks for its own

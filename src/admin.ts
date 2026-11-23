@@ -12,7 +12,7 @@ import { FEE_OPERATIONS, TIERED_OPERATIONS, rowToRule, validateRule, type FeeOpe
 import type { Ctx, Handler } from "./types.js";
 import { adminRequire2fa } from "./stepup.js";
 import * as H from "./holders.js";
-import { checkFredaWebhook, lastWebhookCheck } from "./webhookcheck.js";
+import { checkFredaWebhook, fixFredaWebhook, lastWebhookCheck } from "./webhookcheck.js";
 
 const hasTotp = (u: any): boolean => (u?.factors ?? []).some((f: any) => f?.factor_type === "totp" && f?.status === "verified");
 
@@ -680,6 +680,21 @@ export const adminHandlers: Record<string, Handler> = {
     run: async (d, c) => {
       await requireAdmin(c);
       return (d.refresh ? await checkFredaWebhook() : null) ?? lastWebhookCheck() ?? (await checkFredaWebhook());
+    },
+  },
+
+  /**
+   * Points Freda's webhook at this server (it points elsewhere or its secret is wrong), keeps the new secret, tests it, and submits again
+   * the holders that wait. Super administrator; the password is asked again (this changes where Freda sends payment messages).
+   */
+  adminFixWebhook: {
+    schema: z.object({ confirmPassword: z.string().optional() }).passthrough(),
+    run: async (_d, c) => {
+      await requireAdmin(c, "super");
+      const check = await fixFredaWebhook(c.userId);
+      const resubmitted = check.ok ? await H.resubmitWaitingHolders() : 0;
+      await audit(c, "webhook_fixed", { url: check.url, ok: check.ok, resubmitted });
+      return { check, resubmitted };
     },
   },
 

@@ -459,6 +459,18 @@ export async function refreshPendingHolders(limit = 10) {
   }
 }
 
+/**
+ * After the webhook was pointed at this server: the holders that wait for a decision sent their ID while the webhook went elsewhere, and
+ * Freda does not send the decision again. They are submitted again (the background pass does it, 3 per 2 minutes).
+ */
+export async function resubmitWaitingHolders(): Promise<number> {
+  if (!fredaConfigured()) return 0;
+  const { data, error } = await L.db.from("card_holders").update({ verification_status: "submitted", last_attempt_at: null })
+    .eq("mode", fredaMode()).eq("verification_status", "docs_sent").select("id");
+  if (error) throw error;
+  return (data ?? []).length;
+}
+
 let warnedMigration = false;
 /**
  * Sends to the new card program, a few per round, the customers who need it:

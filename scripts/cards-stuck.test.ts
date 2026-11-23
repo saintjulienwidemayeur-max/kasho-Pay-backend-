@@ -33,7 +33,7 @@ function memDb(seed: Record<string, Row[]> = {}, hooks: { failUpdate?: (table: s
   let counter = 0;
 
   const from = (name: string) => {
-    let op: "select" | "insert" | "update" | "delete" = "select";
+    let op: "select" | "insert" | "update" | "delete" | "upsert" = "select";
     let payload: any;
     const filters: ((r: Row) => boolean)[] = [];
     const orders: [string, boolean][] = [];
@@ -50,6 +50,12 @@ function memDb(seed: Record<string, Row[]> = {}, hooks: { failUpdate?: (table: s
         }
         table(name).push(...list);
         return { data: list.map((r) => ({ ...r })), error: null };
+      }
+      if (op === "upsert") {
+        const k = payload.key !== undefined ? "key" : "id";
+        const hit = table(name).find((r) => r[k] === payload[k]);
+        if (hit) Object.assign(hit, payload); else table(name).push({ id: uuid(), created_at: iso(), updated_at: iso(), ...payload });
+        return { data: null, error: null };
       }
       if (op === "update") {
         const fail = hooks.failUpdate?.(name, payload);
@@ -80,6 +86,7 @@ function memDb(seed: Record<string, Row[]> = {}, hooks: { failUpdate?: (table: s
       select: () => api,
       insert: (p: any) => { op = "insert"; payload = p; return api; },
       update: (p: any) => { op = "update"; payload = p; return api; },
+      upsert: (p: any) => { op = "upsert"; payload = p; return api; },
       delete: () => { op = "delete"; return api; },
       eq: (c: string, v: any) => { filters.push((r) => r[c] === v); return api; },
       neq: (c: string, v: any) => { filters.push((r) => r[c] !== v); return api; },
@@ -813,4 +820,48 @@ test("webhook check: no webhook, another URL, a refused test (401) and a working
   assert.match(W.webhookProblem({ ...ok, test: { sent: false, httpStatus: 502, reason: null } })!, /HTTP 502/);
   assert.equal(W.expectedWebhookUrl({ RENDER_EXTERNAL_URL: "https://k.onrender.com/" } as any), "https://k.onrender.com/api/webhooks/freda");
   assert.equal(W.expectedWebhookUrl({} as any), null);
+});
+
+test("webhook secrets: the environment one and the one kept by the last registration are both accepted; none, or a wrong one, is refused", async () => {
+  const S = await import("../src/webhooksecret.js");
+  const { verifyWebhookSignature } = await import("../src/freda.js");
+  const { createHmac } = await import("node:crypto");
+  assert.deepEqual(S.webhookSecrets({ FREDA_WEBHOOK_SECRET: "whsec_REPLACE_ME" } as any), []);
+  assert.deepEqual(S.webhookSecrets({ FREDA_WEBHOOK_SECRET: "whsec_envsecret1234" } as any), ["whsec_envsecret1234"]);
+  const db = world();
+  await inWorld(db, async () => {
+    await S.saveWebhookSecret("whsec_savedsecret5678", USER);
+    const all = S.webhookSecrets({ FREDA_WEBHOOK_SECRET: "whsec_envsecret1234" } as any);
+    assert.deepEqual(all.sort(), ["whsec_envsecret1234", "whsec_savedsecret5678"]);
+    const body = JSON.stringify({ event: "holder.verified", data: { id: "mpc_1" } });
+    const sig = "sha256=" + createHmac("sha256", "whsec_savedsecret5678").update(body).digest("hex");
+    assert.ok(all.some((s) => verifyWebhookSignature(body, sig, s)), "signed with the saved secret");
+    assert.ok(!["whsec_envsecret1234"].some((s) => verifyWebhookSignature(body, sig, s)), "not with a stale one");
+    await assert.rejects(() => S.saveWebhookSecret("not-a-secret", USER), /usable webhook secret/);
+  });
+  assert.equal(db.table("app_settings")[0]!.key, "freda_webhook_secret");
+});
+
+test("pointing the webhook at this server saves the new secret, checks it, and the holders that wait are submitted again", async () => {
+  const W = await import("../src/webhookcheck.js");
+  const db = world({ card_holders: [holderRow({ verification_status: "docs_sent" })] });
+  process.env["RENDER_EXTERNAL_URL"] = "https://kasho-pay-backend.onrender.com";
+  const registered: string[] = [];
+  let endpoint: any = { url: "https://kasho-pay-1.onrender.com/api/webhooks/freda", active: true };
+  const before = { we: freda.webhookEndpoint, rw: freda.registerWebhook, tw: freda.testWebhook };
+  try {
+    await inWorld(db, async () => {
+      freda.webhookEndpoint = (async () => ({ endpoint })) as any;
+      freda.registerWebhook = (async (url: string) => { registered.push(url); endpoint = { url, active: true }; return { id: "wh_1", url, secret: "whsec_brandnewsecret99" }; }) as any;
+      freda.testWebhook = (async () => ({ sent: true, http_status: 200, reason: null })) as any;
+      const wrong = await W.checkFredaWebhook();
+      assert.match(wrong!.problem!, /sends to https:\/\/kasho-pay-1/, "the old address is named");
+      const fixed = await W.fixFredaWebhook(USER);
+      assert.equal(fixed.ok, true);
+      assert.equal(await H.resubmitWaitingHolders(), 1);
+    });
+  } finally { Object.assign(freda, { webhookEndpoint: before.we, registerWebhook: before.rw, testWebhook: before.tw }); delete process.env["RENDER_EXTERNAL_URL"]; }
+  assert.deepEqual(registered, ["https://kasho-pay-backend.onrender.com/api/webhooks/freda"]);
+  assert.equal(db.table("card_holders")[0]!.verification_status, "submitted", "it will be submitted again, so Freda sends its decision to the right address");
+  assert.equal(db.table("app_settings").find((r) => r.key === "freda_webhook_secret")!.value.secret, "whsec_brandnewsecret99");
 });
