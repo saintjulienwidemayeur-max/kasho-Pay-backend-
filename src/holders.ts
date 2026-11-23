@@ -10,7 +10,12 @@
 //  - Freda keeps one holder per e-mail: for a customer who already had one, POST /v1/cards/holder-profile with
 //    `restart_verification: true` and the complete identity starts a new verification (same mpc_ id; Freda answers `restarted: true`).
 //    POST /v1/cards/holders does NOT do that: it answers an existing e-mail "as is".
-//  - verification_status "submitted": sent by this version and waiting for the decision. "pending" (or "ready") on a holder that
+//  - Registering a holder is NOT enough: Freda keeps it "à vérifier" until the photo of the ID is SUBMITTED for verification
+//    (dashboard, or POST /v1/cards/holder-profile with `restart_verification: true` and the photos). The result comes back at once
+//    (holder.verified / holder.rejected). So every holder is registered, then its ID is submitted right away.
+//  - verification_status "submitted": registered, but the ID photo was not confirmed as submitted yet ("à vérifier" at Freda);
+//    "docs_sent": the ID was submitted (`restarted: true`), waiting for the decision.
+//  - (old note) verification_status "submitted": sent by this version and waiting for the decision. "pending" (or "ready") on a holder that
 //    existed before its program registration comes from an earlier version whose "restart" went to /v1/cards/holders and did nothing.
 import { createHash } from "node:crypto";
 import * as L from "./ledger.js";
@@ -41,6 +46,8 @@ export const deps = {
 export const UNSUPPORTED_COUNTRIES = new Set(["CU", "IR", "KP", "SY", "RU", "BY"]);
 /** The background pass tries a customer again at most every 6 hours (Freda allows 5 verifications per 24 h). */
 const AUTO_RETRY_MS = 6 * 3600_000;
+/** A holder whose ID was not submitted (or not confirmed) is tried again after 30 minutes. */
+const DOCS_RETRY_MS = 30 * 60_000;
 /** A customer can ask for a new verification every 2 minutes at most. */
 const CUSTOMER_RETRY_MS = 2 * 60_000;
 /** A pending holder is asked again at Freda at most every 20 seconds, whatever the number of screens polling it. */
@@ -189,6 +196,9 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   // The new issuer needs the back of every ID document except a passport.
   if (identity.type !== "PASSPORT" && !identity.imageBackUrl) return fail(HOLDER_ERRORS["HOLDER_DOCUMENT_BACK_REQUIRED"]!);
 
+  // What goes to Freda, in kinds and sizes only (never the images): Freda refuses cut-off, blurry or screenshot photos.
+  const kind = (u: unknown) => (typeof u !== "string" ? "none" : u.startsWith("data:") ? `base64 ${Math.round(u.length / 1024)} KB` : "https link");
+  console.log("[holder] ID document to send (", why, "):", userId.slice(0, 8), identity.type, "| front:", kind(identity.imageUrl), "| back:", kind(identity.imageBackUrl));
   const email = realEmail(await deps.email(userId)).trim().toLowerCase();
   if (!email) return fail(HOLDER_FAILED_MESSAGE);
   const idNumber = decryptField(p.id_number);
@@ -207,13 +217,21 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
   const fresh = hadHolder && tagging && opts.fresh !== false;
   let restart = false;
   let restarted: boolean | null = null;
+  let docsSent = false;
   let tagged = false;
   let res: any;
+  /** Submits the ID photos for verification (POST /v1/cards/holder-profile + restart_verification): Freda answers `restarted: true`. */
+  const submitDocs = async (mail: string) => {
+    const r: any = await freda.restartHolderVerification({ ...body, email: mail });
+    const ok = r?.restarted === true;
+    if (!ok) console.error("[holder] POST /v1/cards/holder-profile did not answer restarted: true (", why, "):", userId.slice(0, 8), "fields:", Object.keys(r ?? {}).join(","));
+    return { r, ok };
+  };
   const restartIt = async (mail: string) => {
     restart = true;
-    const r: any = await freda.restartHolderVerification({ ...body, email: mail });
-    restarted = r?.restarted === true;
-    if (!restarted) console.error("[holder] POST /v1/cards/holder-profile did not answer restarted: true (", why, "):", userId.slice(0, 8), "fields:", Object.keys(r ?? {}).join(","));
+    const { r, ok } = await submitDocs(mail);
+    restarted = ok;
+    docsSent = ok;
     return r;
   };
   /**
@@ -260,6 +278,12 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
       return { state: "pending", reason: HOLDER_PENDING_MESSAGE, missing: [], holderId: row?.freda_holder_id ?? null, canRetry: false };
     }
     const fe = e instanceof FredaError ? e : null;
+    if (fe?.code === "HOLDER_VERIFICATION_LIMIT" && hadHolder) {
+      // Freda allows 5 verifications per 24 h: the holder is fine, it is tried again later.
+      await saveRow(row, userId, mode, { last_attempt_at: now });
+      console.error("[holder] verification limit reached for", userId.slice(0, 8), "(5 per 24 h): tried again later");
+      return { state: "pending", reason: HOLDER_PENDING_MESSAGE, missing: [], holderId: row?.freda_holder_id ?? null, canRetry: false };
+    }
     console.error("[holder] POST /v1/cards/holders refused (", why, "):", userId.slice(0, 8), fe?.status, fe?.code, String(fe?.message ?? (e as Error).message).slice(0, 200));
     return fail((fe && HOLDER_ERRORS[fe.code]) || HOLDER_FAILED_MESSAGE);
   }
@@ -273,6 +297,15 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
       return fail(HOLDER_FAILED_MESSAGE, null);
     }
   }
+  // A holder that was just registered (not restarted) stays "à vérifier" until its ID is submitted: do it now.
+  if (!restart && holderId) {
+    try {
+      docsSent = (await submitDocs(String(body["email"]))).ok;
+    } catch (e) {
+      const fe = e instanceof FredaError ? e : null;
+      console.error("[holder] the ID of", holderId, "was NOT submitted (", why, "):", fe?.status, fe?.code, String(fe?.message ?? (e as Error).message).slice(0, 200), "- it is tried again later");
+    }
+  }
   // The POST answer may not say yet what the new issuer thinks: read the holder.
   let h: any = res?.holder ?? res?.profile ?? null;
   if (holderId) h = (await freda.getHolder(holderId).catch(() => null))?.holder ?? h;
@@ -284,10 +317,10 @@ export async function enrollHolder(userId: string, why: "kyc" | "backfill" | "cu
     freda_holder_id: holderId, email: String(body["email"]), first_name: p.first_name, last_name: p.last_name, dob: p.date_of_birth, country, id_number: encryptField(idNumber),
     phone_code: phoneCode, phone_number: phone, address_street: p.address_street, address_city: p.address_city, address_state: p.address_state,
     address_postal_code: p.address_postal_code, status: String(h?.status ?? "pending"), identity_sent: true,
-    verification_status: st.state === "ready" ? "verified" : st.state === "pending" ? "submitted" : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : null,
+    verification_status: st.state === "ready" ? "verified" : st.state === "pending" ? (docsSent ? "docs_sent" : "submitted") : st.state, failure_reason: st.state === "failed" ? (st.reason ?? HOLDER_FAILED_MESSAGE) : null,
     program_enrolled_at: now, last_attempt_at: now, checked_at: now,
   });
-  console.log("[holder]", restart ? (restarted ? "verification restarted" : "restart NOT confirmed by Freda") : tagged ? "registered with a tagged e-mail" : "registered", `(${why})`, String(holderId ?? "?"), "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
+  console.log("[holder]", restart ? (restarted ? "ID submitted (verification restarted)" : "restart NOT confirmed by Freda") : `${tagged ? "registered with a tagged e-mail" : "registered"}, ID ${docsSent ? "submitted" : "NOT submitted yet"}`, `(${why})`, String(holderId ?? "?"), "->", st.state, st.reason ? String(st.reason).slice(0, 160) : "");
   await announce(userId, row?.verification_status, st.state);
   return {
     state: st.state, reason: st.state === "ready" ? null : st.state === "failed" ? saved.failure_reason : HOLDER_PENDING_MESSAGE,
@@ -368,43 +401,45 @@ export async function refreshPendingHolders(limit = 10) {
 let warnedMigration = false;
 /**
  * Sends to the new card program, a few per round, the customers who need it:
- *  1. holders registered by an earlier version, before the holder.verified / holder.rejected webhooks were read (verification_status
- *     "ready"): their decision may have been lost, so their verification is restarted once;
- *  2. customers whose KYC is verified but who were never registered in the program (everyone verified before it);
- *  3. holders still waiting for the program's decision 6 hours after their registration (the webhook never came).
- * Each customer at most every 6 hours (Freda allows 5 verifications per 24 h).
+ *  1. holders registered but whose ID photo was never submitted ("à vérifier" at Freda: every holder registered before this version,
+ *     and any whose submission failed): the ID is submitted for verification, tried again after 30 minutes if it did not work;
+ *  2. customers whose KYC is verified but who were never registered (everyone verified before the program);
+ *  3. holders whose ID was submitted but whose decision never came, 6 hours later: submitted again.
+ * Freda allows 5 verifications per 24 h per holder.
  */
 export async function enrollMissingHolders(limit = 3) {
   if (!fredaConfigured()) return;
   const mode = fredaMode();
-  const { data: rows, error } = await L.db.from("card_holders").select("user_id, created_at, program_enrolled_at, last_attempt_at, verification_status").eq("mode", mode);
+  const { data: rows, error } = await L.db.from("card_holders").select("user_id, freda_holder_id, program_enrolled_at, last_attempt_at, verification_status").eq("mode", mode);
   if (error) {
     if (!warnedMigration) { warnedMigration = true; console.error("[holder] run supabase/migrations/20261121000000_card_program.sql:", error.message); }
     return;
   }
-  const old = (iso: unknown) => !iso || Date.now() - Date.parse(String(iso)) >= AUTO_RETRY_MS;
+  const ago = (iso: unknown) => (iso ? Date.now() - Date.parse(String(iso)) : Infinity);
   const enrolled = new Set<string>();
   const recent = new Set<string>();
-  const legacy: string[] = [];
+  const needDocs: string[] = [];
   const stale: string[] = [];
   for (const r of rows ?? []) {
     const id = String(r.user_id);
     if (r.program_enrolled_at) enrolled.add(id);
-    // Written by an earlier version: "ready" without the webhook, or a "restart" of a holder that already existed, which was sent to
-    // /v1/cards/holders and did nothing. Sent again at once; it becomes "submitted", so only once.
-    const wasRestart = !!r.created_at && !!r.program_enrolled_at && Date.parse(r.program_enrolled_at) - Date.parse(r.created_at) > 60_000;
-    if (r.program_enrolled_at && (r.verification_status === "ready" || (r.verification_status === "pending" && wasRestart))) { legacy.push(id); continue; }
-    if (!old(r.last_attempt_at)) { recent.add(id); continue; }
-    if (r.program_enrolled_at && (r.verification_status === "pending" || r.verification_status === "submitted") && old(r.program_enrolled_at)) stale.push(id);
+    const hasHolder = !!r.program_enrolled_at && !!r.freda_holder_id;
+    if (hasHolder && ["ready", "pending", "submitted"].includes(String(r.verification_status))) {
+      if (ago(r.last_attempt_at) >= DOCS_RETRY_MS) needDocs.push(id); else recent.add(id);
+      continue;
+    }
+    if (ago(r.last_attempt_at) < AUTO_RETRY_MS) { recent.add(id); continue; }
+    if (hasHolder && r.verification_status === "docs_sent" && ago(r.program_enrolled_at) >= AUTO_RETRY_MS) stale.push(id);
   }
   const { data: verified } = await L.db.from("profiles").select("id").eq("kyc_status", "verified").order("updated_at", { ascending: false }).limit(2000);
   const never = (verified ?? []).map((v: any) => String(v.id)).filter((id: string) => !enrolled.has(id) && !recent.has(id));
-  const staleSet = new Set(stale);
-  const all = [...new Set([...legacy, ...never, ...stale])];
+  const all = [...new Set([...needDocs, ...never, ...stale])];
+  const neverSet = new Set(never);
   const todo = all.slice(0, limit);
-  if (all.length) console.log(`[holder] backfill round: ${all.length} to send (earlier versions ${legacy.length}, never registered ${never.length}, waiting over 6 h ${stale.length}), sending ${todo.length} now, ${recent.size} tried less than 6 h ago`);
+  if (all.length) console.log(`[holder] backfill round: ${all.length} to send (ID not submitted yet ${needDocs.length}, never registered ${never.length}, waiting over 6 h ${stale.length}), sending ${todo.length} now, ${recent.size} tried recently`);
   for (const id of todo) {
-    try { await enrollHolder(id, "backfill", { fresh: !staleSet.has(id) }); } catch (e) { console.error("[holder] backfill", id.slice(0, 8), (e as Error).message); }
+    // A holder of the program gets its ID submitted (restart); a customer who never had one gets a new holder (its ID is submitted at once).
+    try { await enrollHolder(id, "backfill", { fresh: neverSet.has(id) }); } catch (e) { console.error("[holder] backfill", id.slice(0, 8), (e as Error).message); }
   }
 }
 
@@ -449,7 +484,7 @@ export async function handleHolderEvent(type: string, d: any) {
 // ------------------------------------------------------------------ what the admin site shows
 export type HolderOverviewRow = {
   userId: string; name: string; holderId: string | null; email: string | null;
-  /** none (never sent), needs_profile, submitted (sent, waiting for the program), verified, failed */
+  /** none (never sent), needs_profile, registered (at Freda, ID not submitted), submitted (ID submitted, waiting), verified, failed */
   status: string; reason: string | null; sentAt: string | null; lastAttemptAt: string | null; checkedAt: string | null;
 };
 
@@ -466,14 +501,15 @@ export async function holderOverview(): Promise<{ mode: string; total: number; c
     const h = byUser.get(p.id);
     const sent = !!h?.program_enrolled_at && !!h?.freda_holder_id;
     const vs = String(h?.verification_status ?? "");
-    const status = !h ? "none" : vs === "verified" ? "verified" : vs === "failed" ? "failed" : vs === "needs_profile" ? "needs_profile" : sent ? "submitted" : "none";
+    // registered = at Freda but the ID photo was not submitted ("à vérifier"); submitted = the ID was submitted, waiting for the decision
+    const status = !h ? "none" : vs === "verified" ? "verified" : vs === "failed" ? "failed" : vs === "needs_profile" ? "needs_profile" : !sent ? "none" : vs === "docs_sent" ? "submitted" : "registered";
     return {
       userId: String(p.id), name: String(p.display_name || `${p.first_name ?? ""} ${p.last_name ?? ""}`.trim() || `@${p.username}`),
       holderId: h?.freda_holder_id ?? null, email: h?.email ?? null, status, reason: h?.failure_reason ?? null,
       sentAt: h?.program_enrolled_at ?? null, lastAttemptAt: h?.last_attempt_at ?? null, checkedAt: h?.checked_at ?? null,
     };
   });
-  const counts: Record<string, number> = { none: 0, needs_profile: 0, submitted: 0, verified: 0, failed: 0 };
+  const counts: Record<string, number> = { none: 0, needs_profile: 0, registered: 0, submitted: 0, verified: 0, failed: 0 };
   for (const i of items) counts[i.status] = (counts[i.status] ?? 0) + 1;
   return { mode, total: items.length, counts, items };
 }
