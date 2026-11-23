@@ -453,6 +453,38 @@ function takeEarly(holderId: string) {
 }
 
 /**
+ * holder.verified for a holder that no row has: read it at Freda and give it to the customer it belongs to (same e-mail, else same
+ * name and birth date, and exactly one customer), so that customer's card holder becomes this verified one. Returns true when linked.
+ */
+async function linkVerifiedHolder(holderId: string): Promise<boolean> {
+  if (!fredaConfigured()) return false;
+  const g: any = await freda.getHolder(holderId).catch((e: unknown) => { console.error("[holder] could not read", holderId, (e as Error).message); return null; });
+  const h = g?.holder ?? g;
+  if (!h?.email && !h?.first_name) return false;
+  const norm = (v: unknown) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase().replace(/\s+/g, " ");
+  const mode = fredaMode();
+  const { data: all, error } = await L.db.from("card_holders").select("*").eq("mode", mode);
+  if (error) throw error;
+  const same = (r: any) => (!!h.email && norm(r.email) === norm(h.email))
+    || (!!h.first_name && norm(r.first_name) === norm(h.first_name) && norm(r.last_name) === norm(h.last_name) && String(r.dob ?? "").slice(0, 10) === String(h.dob ?? "").slice(0, 10));
+  const matches = (all ?? []).filter(same);
+  const users = [...new Set(matches.map((r: any) => String(r.user_id)))];
+  if (users.length !== 1) {
+    console.log("[holder] holder.verified", holderId, "matches", users.length, "customers: not linked");
+    return false;
+  }
+  const row = matches.filter((r: any) => String(r.user_id) === users[0]).sort((a: any, b: any) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+  const { error: upErr } = await L.db.from("card_holders").update({
+    freda_holder_id: holderId, email: h.email ?? row.email, status: String(h.status ?? "enrolled"), verification_status: "verified", failure_reason: null,
+    program_enrolled_at: row.program_enrolled_at ?? new Date().toISOString(), checked_at: new Date().toISOString(),
+  }).eq("id", row.id);
+  if (upErr) throw upErr;
+  console.log("[holder] holder.verified", holderId, "linked to the customer", String(row.user_id).slice(0, 8), "(its holder was", row.freda_holder_id ?? "-", ", now", holderId, ") -> verified");
+  await announce(String(row.user_id), row.verification_status, "ready");
+  return true;
+}
+
+/**
  * holder.verified: the new card program accepted the holder (data.id = mpc_ id): its next cards are program cards, the customer can
  * create one. holder.rejected: not accepted (data.reason); the customer sees why and can ask for a new verification.
  * The event is signed by Freda (checked before this runs) and GET /v1/cards/holders/:id does not carry this decision, so it is applied as is.
@@ -466,6 +498,9 @@ export async function handleHolderEvent(type: string, d: any) {
   const { data: rows, error } = await L.db.from("card_holders").select("*").eq("freda_holder_id", holderId);
   if (error) throw error;
   if (!rows?.length) {
+    // A customer can have several holders at Freda (the first one, a new one with another e-mail, an ID sent again): the one it
+    // verified is not always the one saved here. It is matched to the customer by its e-mail, else by name and birth date.
+    if (verified && (await linkVerifiedHolder(holderId))) return;
     earlyDecisions.set(holderId, { verified, reason, at: Date.now() });
     console.log("[holder]", type, "for a holder not saved here yet, kept for its registration:", holderId);
     return;

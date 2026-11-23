@@ -740,3 +740,27 @@ test("holder overview for the admin: never sent, waiting, verified, refused; and
   assert.equal(sent.length, 1);
   assert.deepEqual([info.state, info.holderId], ["pending", "mpc_btn"]);
 });
+
+test("holder.verified for a holder that no row has (the customer's other holder at Freda): it is linked to the customer by e-mail, else name and birth date", async () => {
+  const OTHER3 = "44444444-4444-4444-4444-444444444444";
+  const db = world({ card_holders: [
+    holderRow({ verification_status: "docs_sent", freda_holder_id: "mpc_old", email: "marie@example.com" }),
+    holderRow({ id: "h9", user_id: OTHER3, freda_holder_id: "mpc_o3", email: "paul@example.com", first_name: "Paul", last_name: "Louis", dob: "1980-01-01", verification_status: "docs_sent" }),
+  ] });
+  await inWorld(db, async () => {
+    freda.getHolder = (async () => ({ holder: { id: "mpc_other_one", status: "enrolled", email: "marie7@example.com", first_name: "Marie", last_name: "Jean", dob: "1990-05-12" } })) as any;
+    await H.handleHolderEvent("holder.verified", { id: "mpc_other_one" });
+  });
+  const mine = db.table("card_holders").find((r) => r.user_id === USER)!;
+  assert.deepEqual([mine.freda_holder_id, mine.email, mine.verification_status], ["mpc_other_one", "marie7@example.com", "verified"], "the verified holder is now the customer's holder");
+  assert.equal(db.table("card_holders").find((r) => r.user_id === OTHER3)!.verification_status, "docs_sent", "nobody else is touched");
+  assert.deepEqual(notifications(db), ["Card profile verified"]);
+
+  // a holder that matches nobody (or two customers) is kept aside, never given to a customer
+  const db2 = world({ card_holders: [holderRow()] });
+  await inWorld(db2, async () => {
+    freda.getHolder = (async () => ({ holder: { id: "mpc_x", status: "enrolled", email: "stranger@example.com", first_name: "Zoe", last_name: "Blanc", dob: "2000-02-02" } })) as any;
+    await H.handleHolderEvent("holder.verified", { id: "mpc_x" });
+  });
+  assert.equal(db2.table("card_holders")[0]!.freda_holder_id, "mpc_1");
+});
